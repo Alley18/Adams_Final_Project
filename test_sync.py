@@ -6,8 +6,7 @@ cred = credentials.Certificate("serviceAccountKey.json")
 
 # 2. Open the "Bridge"
 firebase_admin.initialize_app(cred, {
-    'databaseURL': 'PASTE_YOUR_URL_HERE' # You'll find this in the Firebase Console
-})
+    'databaseURL': 'https://adams-system-a1998-default-rtdb.asia-southeast1.firebasedatabase.app/'
 
 # 3. Send a test message
 ref = db.reference('/test_connection')

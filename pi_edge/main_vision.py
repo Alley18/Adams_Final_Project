@@ -14,7 +14,9 @@ Key changes:
 - PERCLOS frame counter is preserved (from v1 improvement).
 - State priority: DROWSY > DIZZY > DISTRACTED > NORMAL (unchanged).
 """
-
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import logging
 import time
 from collections import deque
@@ -245,7 +247,6 @@ class AdamsVisionSystem:
         self.cloud.stop()
         self.hardware.cleanup()
         self.cap.release()
-        cv2.destroyAllWindows()
 
     # ------------------------------------------------------------------
     # Main loop
@@ -348,11 +349,6 @@ class AdamsVisionSystem:
 
                 # ── Display & sync ────────────────────────────────────────
                 self.sync_to_cloud(hands_on_wheel)
-                self.draw_status(frame, hands_on_wheel)
-                cv2.imshow("ADAMS SYSTEM", frame)
-
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
 
         finally:
             self.cleanup()
