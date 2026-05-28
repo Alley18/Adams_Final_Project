@@ -17,7 +17,7 @@ class RouteOption {
     required this.time,
     required this.description,
     required this.color,
-    required this.profile, // OSRM profile
+    required this.emotion, // Maps to backend emotion logic
   });
 
   final IconData icon;
@@ -25,33 +25,33 @@ class RouteOption {
   final String time;
   final String description;
   final Color color;
-  final String profile; // 'driving', 'cycling', 'foot'
+  final String emotion;
 }
 
 const _routeOptions = [
   RouteOption(
-    icon: Icons.flash_on,
-    label: 'Fast',
+    icon: Icons.sentiment_satisfied,
+    label: 'Calm',
     time: '...',
-    description: 'Fastest driving route',
-    color: Color(0xFFE6B325),
-    profile: 'driving',
-  ),
-  RouteOption(
-    icon: Icons.directions_bike,
-    label: 'Relaxing',
-    time: '...',
-    description: 'Scenic cycling route',
+    description: 'Scenic & balanced route',
     color: Color(0xFF00A896),
-    profile: 'cycling',
+    emotion: 'calm',
   ),
   RouteOption(
-    icon: Icons.directions_walk,
-    label: 'Simple',
+    icon: Icons.flash_on,
+    label: 'Stressed',
     time: '...',
-    description: 'Walking route',
+    description: 'Fastest route to destination',
+    color: Color(0xFFE6B325),
+    emotion: 'stressed',
+  ),
+  RouteOption(
+    icon: Icons.bedtime,
+    label: 'Sleepy',
+    time: '...',
+    description: 'Safe & simple main roads',
     color: Color(0xFF8B9FD4),
-    profile: 'foot',
+    emotion: 'sleepy',
   ),
 ];
 
@@ -69,13 +69,16 @@ class _MoodRouteScreenState extends State<MoodRouteScreen> {
   final TextEditingController _searchController = TextEditingController();
   final Dio _dio = Dio();
 
+  // Replace with your actual backend URL
+  final String _backendUrl = 'http://127.0.0.1:5000';
+
   LatLng? _currentLocation;
   LatLng? _destination;
   String _destinationName = '';
 
   int _selectedIndex = 0;
 
-  // Route polylines per profile
+  // Route polylines per emotion
   final Map<String, List<LatLng>> _routePoints = {};
   final Map<String, String> _routeDurations = {};
 
@@ -127,7 +130,9 @@ class _MoodRouteScreenState extends State<MoodRouteScreen> {
 
       // Move map to current location
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        _mapController.move(_currentLocation!, 14);
+        if (_currentLocation != null) {
+          _mapController.move(_currentLocation!, 14);
+        }
       });
     } catch (e) {
       setState(() => _loadingLocation = false);
@@ -175,7 +180,7 @@ class _MoodRouteScreenState extends State<MoodRouteScreen> {
     }
   }
 
-  // ── Route fetch (OSRM) ────────────────────────────────────────────────────
+  // ── Route fetch (ADAMS Backend with KakaoMap) ──────────────────────────────
 
   Future<void> _fetchAllRoutes() async {
     if (_currentLocation == null || _destination == null) return;
@@ -187,56 +192,70 @@ class _MoodRouteScreenState extends State<MoodRouteScreen> {
     });
 
     for (final option in _routeOptions) {
-      await _fetchRoute(option.profile);
+      await _fetchRouteFromBackend(option.emotion);
     }
 
     setState(() => _loadingRoute = false);
 
-    // Fit map to show full route
-    if (_routePoints[_routeOptions[_selectedIndex].profile]?.isNotEmpty ==
-        true) {
+    if (_routePoints[_routeOptions[_selectedIndex].emotion]?.isNotEmpty == true) {
       _fitMapToRoute();
     }
   }
 
-  Future<void> _fetchRoute(String profile) async {
+  Future<void> _fetchRouteFromBackend(String emotion) async {
     try {
-      final origin = _currentLocation!;
-      final dest = _destination!;
+      final origin = '${_currentLocation!.longitude},${_currentLocation!.latitude}';
+      final dest = '${_destination!.longitude},${_destination!.latitude}';
 
-      final url =
-          'https://router.project-osrm.org/route/v1/$profile/'
-          '${origin.longitude},${origin.latitude};'
-          '${dest.longitude},${dest.latitude}'
-          '?overview=full&geometries=geojson';
+      final response = await _dio.post(
+        '$_backendUrl/route',
+        data: {
+          'origin': origin,
+          'destination': dest,
+          'emotion': emotion,
+        },
+      );
 
-      final response = await _dio.get(url);
       final data = response.data;
 
-      if (data['code'] == 'Ok') {
-        final route = data['routes'][0];
-        final coords =
-            (route['geometry']['coordinates'] as List).map((c) {
-          return LatLng(
-            (c[1] as num).toDouble(),
-            (c[0] as num).toDouble(),
-          );
+      // Handle both Mock and Real Kakao Data
+      if (data['status'] == 'mock') {
+        final coords = (data['coordinates'] as List).map((c) {
+          return LatLng(c[0] as double, c[1] as double);
         }).toList();
 
-        final durationSec = (route['duration'] as num).toDouble();
+        setState(() {
+          _routePoints[emotion] = coords;
+          _routeDurations[emotion] = 'Mock Min';
+        });
+      } else if (data['routes'] != null) {
+        // Kakao API Structure
+        final route = data['routes'][0];
+        final List<LatLng> coords = [];
+        
+        for (var section in route['sections']) {
+          for (var road in section['roads']) {
+            for (var i = 0; i < road['vertexes'].length; i += 2) {
+              coords.add(LatLng(road['vertexes'][i + 1], road['vertexes'][i]));
+            }
+          }
+        }
+
+        final durationSec = route['summary']['duration'] as int;
         final minutes = (durationSec / 60).round();
 
         setState(() {
-          _routePoints[profile] = coords;
-          _routeDurations[profile] = '$minutes min';
+          _routePoints[emotion] = coords;
+          _routeDurations[emotion] = '$minutes min';
         });
       }
-    } catch (_) {}
+    } catch (e) {
+      print('Error fetching route: $e');
+    }
   }
 
   void _fitMapToRoute() {
-    final points =
-        _routePoints[_routeOptions[_selectedIndex].profile] ?? [];
+    final points = _routePoints[_routeOptions[_selectedIndex].emotion] ?? [];
     if (points.isEmpty) return;
 
     double minLat = points.first.latitude;
@@ -285,11 +304,8 @@ class _MoodRouteScreenState extends State<MoodRouteScreen> {
       subtitle: 'Maps',
       child: Column(
         children: [
-          // Search bar
           _buildSearchBar(),
           const SizedBox(height: 10),
-
-          // Map
           Expanded(
             child: ClipRRect(
               borderRadius: BorderRadius.circular(8),
@@ -303,8 +319,7 @@ class _MoodRouteScreenState extends State<MoodRouteScreen> {
                       top: 12,
                       right: 12,
                       child: Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 10, vertical: 6),
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                         decoration: BoxDecoration(
                           color: Colors.black87,
                           borderRadius: BorderRadius.circular(20),
@@ -321,14 +336,12 @@ class _MoodRouteScreenState extends State<MoodRouteScreen> {
                               ),
                             ),
                             SizedBox(width: 8),
-                            Text('Finding routes...',
-                                style: TextStyle(
-                                    fontSize: 11, color: Colors.white)),
+                            Text('Syncing with Backend...',
+                                style: TextStyle(fontSize: 11, color: Colors.white)),
                           ],
                         ),
                       ),
                     ),
-                  // My location button
                   Positioned(
                     bottom: 12,
                     right: 12,
@@ -346,14 +359,8 @@ class _MoodRouteScreenState extends State<MoodRouteScreen> {
               ),
             ),
           ),
-
           const SizedBox(height: 14),
-
-          // Search results dropdown
-          if (_showSearch && _searchResults.isNotEmpty)
-            _buildSearchResults(),
-
-          // Route tiles
+          if (_showSearch && _searchResults.isNotEmpty) _buildSearchResults(),
           if (_destination != null) _buildRouteTiles(),
         ],
       ),
@@ -392,11 +399,9 @@ class _MoodRouteScreenState extends State<MoodRouteScreen> {
         ),
         focusedBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(8),
-          borderSide:
-              const BorderSide(color: Color(0xFF00A896), width: 1.5),
+          borderSide: const BorderSide(color: Color(0xFF00A896), width: 1.5),
         ),
-        contentPadding:
-            const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       ),
       onTap: () => setState(() => _showSearch = true),
       onChanged: _searchPlaces,
@@ -413,8 +418,7 @@ class _MoodRouteScreenState extends State<MoodRouteScreen> {
       child: _searchingPlace
           ? const Padding(
               padding: EdgeInsets.all(16),
-              child: Center(
-                  child: CircularProgressIndicator(strokeWidth: 2)),
+              child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
             )
           : ListView.separated(
               shrinkWrap: true,
@@ -428,12 +432,10 @@ class _MoodRouteScreenState extends State<MoodRouteScreen> {
                 final r = _searchResults[i];
                 return ListTile(
                   dense: true,
-                  leading: const Icon(Icons.location_on,
-                      color: Color(0xFF00A896), size: 18),
+                  leading: const Icon(Icons.location_on, color: Color(0xFF00A896), size: 18),
                   title: Text(
                     r['name'] as String,
-                    style: const TextStyle(
-                        color: Colors.white, fontSize: 12),
+                    style: const TextStyle(color: Colors.white, fontSize: 12),
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                   ),
@@ -445,13 +447,13 @@ class _MoodRouteScreenState extends State<MoodRouteScreen> {
   }
 
   Widget _buildMap() {
-    final selectedProfile = _routeOptions[_selectedIndex].profile;
+    final selectedEmotion = _routeOptions[_selectedIndex].emotion;
     final selectedColor = _routeOptions[_selectedIndex].color;
 
     return FlutterMap(
       mapController: _mapController,
       options: MapOptions(
-        initialCenter: _currentLocation ?? const LatLng(41.2995, 69.2401),
+        initialCenter: _currentLocation ?? const LatLng(37.5665, 126.9780),
         initialZoom: 13,
         onTap: (_, __) {
           setState(() {
@@ -461,42 +463,33 @@ class _MoodRouteScreenState extends State<MoodRouteScreen> {
         },
       ),
       children: [
-        // OSM tile layer
         TileLayer(
           urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
           userAgentPackageName: 'com.example.adams_mobile',
         ),
-
-        // Inactive routes (faded)
         for (var i = 0; i < _routeOptions.length; i++)
-          if (i != _selectedIndex &&
-              _routePoints[_routeOptions[i].profile] != null)
+          if (i != _selectedIndex && _routePoints[_routeOptions[i].emotion] != null)
             PolylineLayer(
               polylines: [
                 Polyline(
-                  points: _routePoints[_routeOptions[i].profile]!,
+                  points: _routePoints[_routeOptions[i].emotion]!,
                   strokeWidth: 3,
-                  color: _routeOptions[i].color.withValues(alpha: 0.25),
+                  color: _routeOptions[i].color.withOpacity(0.25),
                 ),
               ],
             ),
-
-        // Active route
-        if (_routePoints[selectedProfile] != null)
+        if (_routePoints[selectedEmotion] != null)
           PolylineLayer(
             polylines: [
               Polyline(
-                points: _routePoints[selectedProfile]!,
+                points: _routePoints[selectedEmotion]!,
                 strokeWidth: 5,
                 color: selectedColor,
               ),
             ],
           ),
-
-        // Markers
         MarkerLayer(
           markers: [
-            // Current location
             if (_currentLocation != null)
               Marker(
                 point: _currentLocation!,
@@ -506,22 +499,17 @@ class _MoodRouteScreenState extends State<MoodRouteScreen> {
                   decoration: BoxDecoration(
                     color: const Color(0xFF00A896),
                     shape: BoxShape.circle,
-                    border:
-                        Border.all(color: Colors.white, width: 3),
+                    border: Border.all(color: Colors.white, width: 3),
                     boxShadow: [
                       BoxShadow(
-                        color: const Color(0xFF00A896)
-                            .withValues(alpha: 0.5),
+                        color: const Color(0xFF00A896).withOpacity(0.5),
                         blurRadius: 8,
                       ),
                     ],
                   ),
-                  child: const Icon(Icons.navigation,
-                      size: 18, color: Colors.white),
+                  child: const Icon(Icons.navigation, size: 18, color: Colors.white),
                 ),
               ),
-
-            // Destination
             if (_destination != null)
               Marker(
                 point: _destination!,
@@ -535,18 +523,15 @@ class _MoodRouteScreenState extends State<MoodRouteScreen> {
                       decoration: BoxDecoration(
                         color: selectedColor,
                         shape: BoxShape.circle,
-                        border: Border.all(
-                            color: Colors.white, width: 2),
+                        border: Border.all(color: Colors.white, width: 2),
                         boxShadow: [
                           BoxShadow(
-                            color: selectedColor
-                                .withValues(alpha: 0.5),
+                            color: selectedColor.withOpacity(0.5),
                             blurRadius: 8,
                           ),
                         ],
                       ),
-                      child: const Icon(Icons.flag,
-                          size: 16, color: Colors.white),
+                      child: const Icon(Icons.flag, size: 16, color: Colors.white),
                     ),
                     Container(
                       width: 2,
@@ -569,7 +554,7 @@ class _MoodRouteScreenState extends State<MoodRouteScreen> {
           if (i > 0) const SizedBox(height: 10),
           _RouteTile(
             route: _routeOptions[i],
-            duration: _routeDurations[_routeOptions[i].profile] ?? '...',
+            duration: _routeDurations[_routeOptions[i].emotion] ?? '...',
             isSelected: i == _selectedIndex,
             onTap: () {
               setState(() => _selectedIndex = i);
@@ -581,8 +566,6 @@ class _MoodRouteScreenState extends State<MoodRouteScreen> {
     );
   }
 }
-
-// ── Route Tile ────────────────────────────────────────────────────────────────
 
 class _RouteTile extends StatelessWidget {
   const _RouteTile({
@@ -613,17 +596,14 @@ class _RouteTile extends StatelessWidget {
         child: FilledButton.tonal(
           onPressed: onTap,
           style: FilledButton.styleFrom(
-            backgroundColor: isSelected
-                ? route.color.withValues(alpha: 0.18)
-                : null,
+            backgroundColor: isSelected ? route.color.withOpacity(0.18) : null,
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(8),
             ),
           ),
           child: Row(
             children: [
-              Icon(route.icon,
-                  color: isSelected ? route.color : null),
+              Icon(route.icon, color: isSelected ? route.color : null),
               const SizedBox(width: 12),
               Expanded(
                 child: Column(
