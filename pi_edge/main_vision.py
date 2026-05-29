@@ -49,7 +49,7 @@ BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
-CAMERA_INDEX = 0
+CAMERA_INDEX = 1
 
 # -------------------------------
 # Drowsiness
@@ -70,6 +70,7 @@ DISTRACTION_ANGLE = 10
 
 MOVEMENT_HISTORY_SIZE = 20
 DIZZY_SWAY_THRESHOLD = 6
+HANDS_LOG_INTERVAL_SECONDS = 5
 
 # =========================================================
 # LOGGING
@@ -106,8 +107,12 @@ class AdamsVisionSystem:
     def __init__(self):
 
         logger.info("Starting ADAMS v3")
-        
+
         self.hardware = HardwareController()
+
+        # hands_on_wheel is owned by the Pi (guardian_dart.py reads
+        # the FSR directly). The laptop has no GPIO so we always send
+        # True here — the Pi overrides it with the real sensor value.
         self.hands_on_wheel = True
 
         self.cloud = CloudSync()
@@ -223,8 +228,10 @@ class AdamsVisionSystem:
             "sway_score": round(self.sway_score, 2),
 
             "eyes_closed_frames": self.eyes_closed_frames,
-            
-            "hands_on_wheel": self.hands_on_wheel,
+
+            # Always True from the laptop – the Pi reads the real
+            # FSR value in guardian_dart.py and acts on it there.
+            "hands_on_wheel": True,
 
             "timestamp": time.time(),
         })
@@ -404,8 +411,6 @@ class AdamsVisionSystem:
                 # =====================================================
 
                 self.set_state(candidate_state)
-                
-                self.hands_on_wheel = self.hardware.is_hands_on_wheel()
 
                 # =====================================================
                 # EMOTION
@@ -463,13 +468,13 @@ class AdamsVisionSystem:
                     200,
                     (255, 255, 0),
                 )
-                
+
                 self.draw_text(
                     frame,
-                    f"HANDS ON WHEEL: {self.hands_on_wheel}",
+                    "HANDS: Pi FSR sensor",
                     240,
-                    (0, 255, 0) if self.hands_on_wheel else (0, 0, 255),
-                )    
+                    (200, 200, 200),
+                )
 
                 # =====================================================
                 # CLOUD
@@ -480,14 +485,12 @@ class AdamsVisionSystem:
                 # =====================================================
                 # SHOW
                 # =====================================================
-                
+
                 cv2.namedWindow("ADAMS SYSTEM", cv2.WINDOW_NORMAL)
                 cv2.resizeWindow("ADAMS SYSTEM", 720, 540)
-                
-                
+
                 frame = cv2.resize(frame, (720, 540))
-                
-                
+
                 cv2.imshow("ADAMS SYSTEM", frame)
 
                 if cv2.waitKey(1) & 0xFF == ord("q"):

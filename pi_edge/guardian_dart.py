@@ -11,12 +11,13 @@ Responsibilities:
   - Sends notifications (stub)
   - Writes alerts back to Firebase
   - Falls back to polling if streaming fails
+  - Shows HELP on LCD when hands leave wheel during danger state
 
 Usage:
     python guardian_dart.py
 
 Requirements:
-    pip install firebase-admin requests
+    pip install firebase-admin requests smbus2
 
 Place:
     serviceAccountKey.json
@@ -57,8 +58,8 @@ DRIVER_STATUS_PATH = os.getenv("ADAMS_DRIVER_STATUS_PATH", "/driver_status")
 # Danger escalation thresholds (seconds)
 ESCALATION_THRESHOLD_SECONDS = {
     "DISTRACTED": 8.0,
-    "DIZZY": 6.0,
-    "DROWSY": 10.0,
+    "DIZZY":      6.0,
+    "DROWSY":     10.0,
 }
 
 DANGER_STATES = {
@@ -66,6 +67,9 @@ DANGER_STATES = {
     "DIZZY",
     "DROWSY",
 }
+
+# How long hands must be off wheel (during danger) before HELP is shown
+HANDS_OFF_HELP_THRESHOLD_SECONDS = 3.0
 
 # ─────────────────────────────────────────────────────────────
 # Logging
@@ -91,7 +95,6 @@ def send_notification(state: str, duration: float, data: dict) -> None:
     """
     Replace with actual SMS/email/Telegram notification logic.
     """
-
     logger.warning(
         f"[NOTIFY] Driver in {state} for {duration:.1f}s | "
         f"emotion={data.get('emotion')} | "
@@ -102,9 +105,7 @@ def send_notification(state: str, duration: float, data: dict) -> None:
     # Example Twilio implementation:
     #
     # from twilio.rest import Client
-    #
     # client = Client(TWILIO_SID, TWILIO_TOKEN)
-    #
     # client.messages.create(
     #     body=f"ADAMS ALERT: Driver {state} for {duration:.0f}s",
     #     from_=TWILIO_FROM,
@@ -122,18 +123,20 @@ class GuardianDart:
     def __init__(self):
 
         self.firebase_enabled = False
-
-        self.driver_ref = None
-        self.alert_ref = None
-
-        self._listener = None
+        self.driver_ref  = None
+        self.alert_ref   = None
+        self._listener   = None
 
         self._current_state = "NORMAL"
-        self._state_since = None
+        self._state_since   = None
+        self._last_data     = {}
+        self._escalated     = False
 
-        self._last_data = {}
-
-        self._escalated = False
+        # ── Hands-off tracking ───────────────────────────
+        # Tracks when hands first left the wheel during a danger state
+        self._hands_off_since  = None
+        # Prevents showing HELP repeatedly until hands return
+        self._help_displayed   = False
 
         self._lock = threading.Lock()
 
@@ -141,21 +144,18 @@ class GuardianDart:
 
         self._connect_firebase()
 
-    # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────
 
     def _internet_available(self) -> bool:
-
         try:
             requests.get("https://google.com", timeout=3)
             return True
-
         except Exception:
             return False
 
-    # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────
 
     def _connect_firebase(self) -> None:
-
         try:
             import firebase_admin
             from firebase_admin import credentials, db
@@ -166,93 +166,55 @@ class GuardianDart:
                 )
 
             if not firebase_admin._apps:
-
-                cred = credentials.Certificate(
-                    str(SERVICE_ACCOUNT_PATH)
-                )
-
-                firebase_admin.initialize_app(
-                    cred,
-                    {
-                        "databaseURL": DATABASE_URL
-                    }
-                )
+                cred = credentials.Certificate(str(SERVICE_ACCOUNT_PATH))
+                firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
 
             self.driver_ref = db.reference(DRIVER_STATUS_PATH)
-
-            self.alert_ref = db.reference("/guardian_alerts")
-
+            self.alert_ref  = db.reference("/guardian_alerts")
             self.firebase_enabled = True
-
-            logger.info(
-                "Connected to Firebase Realtime Database"
-            )
+            logger.info("Connected to Firebase Realtime Database")
 
         except ImportError:
-
             logger.error(
                 "firebase_admin not installed.\n"
-                "Run:\n"
-                "pip install firebase-admin"
+                "Run: pip install firebase-admin"
             )
-
         except Exception as exc:
+            logger.error(f"Firebase connection failed: {exc}")
 
-            logger.error(
-                f"Firebase connection failed: {exc}"
-            )
-
-    # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────
 
     def _on_data_change(self, event) -> None:
-        """
-        Firebase realtime streaming callback.
-        """
-
+        """Firebase realtime streaming callback."""
         try:
-
             if event.data is None:
                 return
 
             with self._lock:
-
-                # Full document update
                 if event.path == "/":
-
                     if not isinstance(event.data, dict):
                         return
-
                     self._last_data = event.data.copy()
-
-                # Partial update
                 else:
-
                     key = event.path.lstrip("/")
-
                     self._last_data[key] = event.data
-
                 data = self._last_data.copy()
 
-            state = data.get("driver_state", "NORMAL")
-
+            state   = data.get("driver_state", "NORMAL")
             emotion = data.get("emotion", "UNKNOWN")
 
-            hands = data.get("hands_on_wheel", True)
+            # Always read FSR directly from the Pi hardware.
+            # Do NOT use data.get("hands_on_wheel") — that value
+            # is written by the laptop which has no GPIO and
+            # always sends True.
+            hands = self.hardware.is_hands_on_wheel()
 
-            self._handle_state(
-                state,
-                emotion,
-                hands,
-                data,
-            )
+            self._handle_state(state, emotion, hands, data)
 
         except Exception as exc:
+            logger.error(f"Stream callback error: {exc}")
 
-            logger.error(
-                f"Stream callback error: {exc}"
-            )
-
-    # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────
 
     def _handle_state(
         self,
@@ -264,34 +226,41 @@ class GuardianDart:
 
         now = time.time()
 
+        # Update Firebase with REAL Pi FSR value
+        try:
+            if self.driver_ref:
+                self.driver_ref.update({
+                    "hands_on_wheel": hands
+                })
+        except Exception as exc:
+            logger.error(f"Failed updating hands_on_wheel: {exc}")
+
         # ── State transition ──────────────────────────────
 
         if state != self._current_state:
 
             logger.info(
-                f"State change: "
-                f"{self._current_state} → {state} | "
+                f"State change: {self._current_state} → {state} | "
                 f"emotion={emotion} | "
                 f"hands={'ON' if hands else 'OFF'}"
             )
 
             self._current_state = state
+            self._escalated     = False
 
-            self._escalated = False
+            # Reset hands-off tracking on every state change
+            self._hands_off_since = None
+            self._help_displayed  = False
 
             if state in DANGER_STATES:
-
                 self._state_since = now
-
-                logger.warning(
-                    f"⚠ DANGER state entered: {state}"
-                )
-
+                logger.warning(f"⚠ DANGER state entered: {state}")
                 self.hardware.buzz_alert(state)
-
+                self.hardware.show_status_on_display(state)
             else:
-
                 self._state_since = None
+                # Clear display when driver returns to normal
+                self.hardware.clear_display()
 
         # ── Escalation logic ─────────────────────────────
 
@@ -300,46 +269,72 @@ class GuardianDart:
             and self._state_since is not None
             and not self._escalated
         ):
-
-            duration = now - self._state_since
-
-            threshold = ESCALATION_THRESHOLD_SECONDS.get(
-                state,
-                8.0
-            )
+            duration  = now - self._state_since
+            threshold = ESCALATION_THRESHOLD_SECONDS.get(state, 8.0)
 
             if duration >= threshold:
-
                 logger.critical(
-                    f"🚨 ESCALATION: {state} "
-                    f"for {duration:.1f}s | "
+                    f"🚨 ESCALATION: {state} for {duration:.1f}s | "
                     f"emotion={emotion} | "
                     f"hands={'ON' if hands else 'OFF'}"
                 )
-
-                send_notification(
-                    state,
-                    duration,
-                    data,
-                )
-
-                self._write_alert_to_firebase(
-                    state,
-                    duration,
-                    data,
-                )
-
+                send_notification(state, duration, data)
+                self._write_alert_to_firebase(state, duration, data)
                 self._escalated = True
 
-        # ── Hands off wheel warning ──────────────────────
+        # ── Hands-off wheel → HELP display ───────────────
 
-        if state in DANGER_STATES and not hands:
+        if state in DANGER_STATES:
 
-            logger.warning(
-                f"🤚 Hands OFF wheel during {state}"
-            )
+            if not hands:
 
-    # ─────────────────────────────────────────────────────────
+                if self._hands_off_since is None:
+                    self._hands_off_since = now
+                    logger.warning(f"🤚 Hands OFF wheel during {state} – starting timer")
+
+                hands_off_duration = now - self._hands_off_since
+
+                if (
+                    hands_off_duration >= HANDS_OFF_HELP_THRESHOLD_SECONDS
+                    and not self._help_displayed
+                ):
+                    logger.critical(
+                        f"🆘 Hands off wheel for {hands_off_duration:.1f}s "
+                        f"during {state} – possible medical emergency!"
+                    )
+
+                    print("\n" + "=" * 50)
+                    print("  🆘  EMERGENCY DETECTED  🆘")
+                    print(f"  STATE   : {state}")
+                    print(f"  HANDS   : OFF WHEEL for {hands_off_duration:.1f}s")
+                    print(f"  EMOTION : {data.get('emotion', 'UNKNOWN')}")
+                    print("  ACTION  : HELP displayed on LCD")
+                    print("  -> Firebase alert written")
+                    print("=" * 50 + "\n")
+
+                    self.hardware.buzz_alert("EMERGENCY")
+
+                    self.hardware.show_help_on_display()
+                    self._write_alert_to_firebase(
+                        state="HANDS_OFF_EMERGENCY",
+                        duration=hands_off_duration,
+                        data=data,
+                    )
+                    self._help_displayed = True
+
+            else:
+                # Hands returned to wheel – reset tracking and clear HELP
+                if self._hands_off_since is not None:
+                    logger.info("✅ Hands returned to wheel – clearing HELP display")
+                    self._hands_off_since = None
+                    self._help_displayed  = False
+                    self.hardware.show_status_on_display(state)
+
+        else:
+            self._hands_off_since = None
+            self._help_displayed  = False
+
+    # ─────────────────────────────────────────────────────
 
     def _write_alert_to_firebase(
         self,
@@ -348,177 +343,86 @@ class GuardianDart:
         data: dict,
     ) -> None:
 
-        if not self.firebase_enabled:
-            return
-
-        if self.alert_ref is None:
+        if not self.firebase_enabled or self.alert_ref is None:
             return
 
         try:
-
             alert = {
-
-                "state": state,
-
-                "duration_seconds": round(
-                    duration,
-                    1
-                ),
-
-                "emotion": data.get(
-                    "emotion"
-                ),
-
-                "hands_on_wheel": data.get(
-                    "hands_on_wheel"
-                ),
-
-                "avg_movement": data.get(
-                    "avg_movement"
-                ),
-
-                "eyes_closed_frames": data.get(
-                    "eyes_closed_frames"
-                ),
-
-                "timestamp_iso": datetime.now(
-                    timezone.utc
-                ).isoformat(),
-
-                "timestamp_epoch": time.time(),
+                "state":              state,
+                "duration_seconds":   round(duration, 1),
+                "emotion":            data.get("emotion"),
+                "hands_on_wheel":     data.get("hands_on_wheel"),
+                "avg_movement":       data.get("avg_movement"),
+                "eyes_closed_frames": data.get("eyes_closed_frames"),
+                "timestamp_iso":      datetime.now(timezone.utc).isoformat(),
+                "timestamp_epoch":    time.time(),
             }
-
             self.alert_ref.push(alert)
-
-            logger.info(
-                "Alert written to Firebase "
-                "/guardian_alerts"
-            )
+            logger.info("Alert written to Firebase /guardian_alerts")
 
         except Exception as exc:
+            logger.error(f"Failed writing alert: {exc}")
 
-            logger.error(
-                f"Failed writing alert: {exc}"
-            )
+    # ─────────────────────────────────────────────────────
 
-    # ─────────────────────────────────────────────────────────
+    def _poll_loop(self, interval: float = 1.5) -> None:
 
-    def _poll_loop(
-        self,
-        interval: float = 1.5,
-    ) -> None:
-
-        logger.info(
-            f"Polling Firebase every "
-            f"{interval}s"
-        )
+        logger.info(f"Polling Firebase every {interval}s")
 
         while True:
-
             try:
-
                 if not self._internet_available():
-
-                    logger.warning(
-                        "No internet connection..."
-                    )
-
+                    logger.warning("No internet connection...")
                     time.sleep(interval)
-
                     continue
 
                 data = self.driver_ref.get()
 
                 if isinstance(data, dict):
-
                     with self._lock:
-
                         self._last_data = data.copy()
 
-                    state = data.get(
-                        "driver_state",
-                        "NORMAL"
-                    )
+                    state   = data.get("driver_state", "NORMAL")
+                    emotion = data.get("emotion", "UNKNOWN")
 
-                    emotion = data.get(
-                        "emotion",
-                        "UNKNOWN"
-                    )
+                    # Read FSR directly from Pi hardware
+                    hands = self.hardware.is_hands_on_wheel()
 
-                    hands = data.get(
-                        "hands_on_wheel",
-                        True
-                    )
-
-                    self._handle_state(
-                        state,
-                        emotion,
-                        hands,
-                        data,
-                    )
+                    self._handle_state(state, emotion, hands, data)
 
             except Exception as exc:
-
-                logger.error(
-                    f"Polling error: {exc}"
-                )
+                logger.error(f"Polling error: {exc}")
 
             time.sleep(interval)
 
-    # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────
 
     def run(self) -> None:
 
         if not self.firebase_enabled:
-
-            logger.error(
-                "Firebase not connected."
-            )
-
+            logger.error("Firebase not connected.")
             return
 
-        logger.info(
-            "GuardianDart listening "
-            "for driver updates..."
-        )
+        logger.info("GuardianDart listening for driver updates...")
 
         try:
+            self._listener = self.driver_ref.listen(self._on_data_change)
 
-            # Realtime Firebase stream
-            self._listener = self.driver_ref.listen(
-                self._on_data_change
-            )
-
-            # Keep alive
             while True:
                 time.sleep(1)
 
         except KeyboardInterrupt:
-
-            logger.info(
-                "GuardianDart stopped by user."
-            )
+            logger.info("GuardianDart stopped by user.")
 
         except Exception as exc:
-
-            logger.error(
-                f"Streaming failed: {exc}"
-            )
-
-            logger.warning(
-                "Falling back to polling mode..."
-            )
-
+            logger.error(f"Streaming failed: {exc}")
+            logger.warning("Falling back to polling mode...")
             self._poll_loop()
 
         finally:
-
             try:
-
                 if self._listener:
-
                     self._listener.close()
-
             except Exception:
                 pass
 
@@ -530,7 +434,5 @@ class GuardianDart:
 # ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-
     guardian = GuardianDart()
-
     guardian.run()
