@@ -1,0 +1,15 @@
+{
+  "project": "ADAMS",
+  "version": "1.0.0",
+  "data_contract": {
+    "input": {
+      "driver_state": "string",
+      "confidence_score": "float",
+      "timestamp": "iso8601"
+    },
+    "output": {
+      "level": "INFO | WARNING | DANGER",
+      "message": "string (max 10 words)"
+    }
+  }
+}

@@ -1,0 +1,9 @@
+timestamp,input,level,message,buzzer,suggested_route
+2026-04-10 11:15:43,"Eye openness: 95%, Emotion: Neutral, Gaze: Forward",INFO,"No alert necessary, driving is good",False,FASTEST
+2026-04-10 11:15:50,"Eye openness: 5%, Yawning: YES, Duration: 3s",DANGER,Driver may be falling asleep,True,REST_STOP
+2026-04-10 11:15:54,"Eye openness: 85%, Emotion: High Anger, Gaze: Road",WARNING,Concentrate on the road,False,SCENIC
+2026-04-10 11:15:57,"Eye openness: 90%, Emotion: Happy, Gaze: Road",INFO,"Everything is fine, keep focused",False,FASTEST
+2026-04-10 11:19:56,"Eye openness: 95%, Emotion: Neutral, Gaze: Forward",INFO,Focus on the road ahead,False,FASTEST
+2026-04-10 11:20:02,"Eye openness: 5%, Yawning: YES, Duration: 3s",DANGER,Driver is extremely sleepy,True,REST_STOP
+2026-04-10 11:20:12,"Eye openness: 85%, Emotion: High Anger, Gaze: Road",WARNING,"Anger detected, adjust your mood",False,SCENIC
+2026-04-10 11:20:16,"Eye openness: 90%, Emotion: Happy, Gaze: Road",INFO,Driver is in neutral state,False,FASTEST
