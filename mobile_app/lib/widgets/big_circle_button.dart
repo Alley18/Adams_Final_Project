@@ -19,26 +19,45 @@ class BigCircleButton extends StatelessWidget {
     return SizedBox(
       width: 210,
       height: 210,
-      child: FilledButton(
-        style: FilledButton.styleFrom(
-          backgroundColor: color,
-          shape: const CircleBorder(),
-        ),
-        onPressed: onPressed,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 72),
-            const SizedBox(height: 10),
-            Text(
-              label,
-              style: const TextStyle(
-                fontSize: 28,
-                fontWeight: FontWeight.w800,
-                letterSpacing: 0,
-              ),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          boxShadow: [
+            BoxShadow(
+              color: color.withValues(alpha: 0.34),
+              blurRadius: 32,
+              spreadRadius: 4,
             ),
           ],
+        ),
+        child: FilledButton(
+          style: FilledButton.styleFrom(
+            backgroundColor: color,
+            foregroundColor: Colors.white,
+            disabledBackgroundColor: color.withValues(alpha: 0.42),
+            shape: const CircleBorder(),
+            side: BorderSide(
+              color: Colors.white.withValues(alpha: 0.24),
+              width: 1.2,
+            ),
+          ),
+          onPressed: onPressed,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 72),
+              const SizedBox(height: 10),
+              Text(
+                label,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontSize: 28,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 0,
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );

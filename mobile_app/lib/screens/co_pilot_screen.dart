@@ -251,7 +251,7 @@ class _CoPilotScreenState extends State<CoPilotScreen> {
             label: isListening ? 'Listening' : 'Talk',
             color: isListening
                 ? const Color(0xFFE6B325)
-                : const Color(0xFF00A896),
+                : const Color(0xFFFF9F1C),
             onPressed: isThinking ? null : toggleListening,
           ),
           const SizedBox(height: 16),
@@ -296,9 +296,18 @@ class AssistantHeader extends StatelessWidget {
       width: double.infinity,
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.07),
+        color: const Color(0xFF171B21).withValues(alpha: 0.94),
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
+        border: Border.all(
+          color: const Color(0xFFFF9F1C).withValues(alpha: 0.22),
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.24),
+            blurRadius: 16,
+            offset: const Offset(0, 8),
+          ),
+        ],
       ),
       child: Row(
         children: [
@@ -307,9 +316,18 @@ class AssistantHeader extends StatelessWidget {
             height: 12,
             decoration: BoxDecoration(
               color: isOnline
-                  ? const Color(0xFF24B47E)
+                  ? const Color(0xFFFF9F1C)
                   : const Color(0xFFE6B325),
               shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: (isOnline
+                          ? const Color(0xFFFF9F1C)
+                          : const Color(0xFFE6B325))
+                      .withValues(alpha: 0.45),
+                  blurRadius: 12,
+                ),
+              ],
             ),
           ),
           const SizedBox(width: 10),
@@ -327,7 +345,7 @@ class AssistantHeader extends StatelessWidget {
           const SizedBox(width: 8),
           Icon(
             isOnline ? Icons.cloud_done : Icons.key,
-            color: Colors.white70,
+            color: const Color(0xFFFFC857),
           ),
         ],
       ),
@@ -390,15 +408,21 @@ class AssistantBubble extends StatelessWidget {
         constraints: const BoxConstraints(maxWidth: 340),
         child: DecoratedBox(
           decoration: BoxDecoration(
-            color: Colors.white.withValues(alpha: 0.08),
+            color: const Color(0xFF171B21),
             borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
+            border: Border.all(
+              color: const Color(0xFFFF9F1C).withValues(alpha: 0.16),
+            ),
           ),
           child: Padding(
             padding: const EdgeInsets.all(12),
             child: Text(
               text,
-              style: const TextStyle(height: 1.35, letterSpacing: 0),
+              style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.86),
+                height: 1.35,
+                letterSpacing: 0,
+              ),
             ),
           ),
         ),
@@ -419,15 +443,18 @@ class DriverBubble extends StatelessWidget {
         constraints: const BoxConstraints(maxWidth: 320),
         child: DecoratedBox(
           decoration: BoxDecoration(
-            color: Theme.of(context).colorScheme.primaryContainer,
+            color: const Color(0xFFFF9F1C).withValues(alpha: 0.18),
             borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: const Color(0xFFFF9F1C).withValues(alpha: 0.42),
+            ),
           ),
           child: Padding(
             padding: const EdgeInsets.all(12),
             child: Text(
               text,
-              style: TextStyle(
-                color: Theme.of(context).colorScheme.onPrimaryContainer,
+              style: const TextStyle(
+                color: Color(0xFFFFE6B8),
                 height: 1.35,
                 letterSpacing: 0,
               ),
@@ -463,7 +490,17 @@ class CommandGrid extends StatelessWidget {
       ),
       itemBuilder: (context, index) {
         final command = commands[index];
-        return FilledButton.tonalIcon(
+        return FilledButton.icon(
+          style: FilledButton.styleFrom(
+            backgroundColor: const Color(0xFF171B21),
+            foregroundColor: const Color(0xFFFFC857),
+            side: BorderSide(
+              color: const Color(0xFFFF9F1C).withValues(alpha: 0.22),
+            ),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+            ),
+          ),
           onPressed: () => onCommandSelected(command),
           icon: Icon(command.icon),
           label: Text(command.label),

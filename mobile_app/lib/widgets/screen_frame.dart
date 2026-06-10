@@ -16,26 +16,81 @@ class ScreenFrame extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ColoredBox(
-      color: backgroundColor ?? const Color(0xFF101418),
+    final baseColor = backgroundColor ?? const Color(0xFF0C0F13);
+    final isAlert = backgroundColor != null;
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: baseColor,
+        gradient: isAlert
+            ? null
+            : const LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  Color(0xFF18110B),
+                  Color(0xFF0C0F13),
+                  Color(0xFF10151B),
+                ],
+              ),
+      ),
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(20, 18, 20, 16),
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              title,
-              style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: 0,
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.18),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: isAlert
+                      ? Colors.white.withValues(alpha: 0.22)
+                      : const Color(0xFFFF9F1C).withValues(alpha: 0.24),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    width: 4,
+                    height: 44,
+                    decoration: BoxDecoration(
+                      color: isAlert ? Colors.white : const Color(0xFFFF9F1C),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
                   ),
-            ),
-            Text(
-              subtitle,
-              style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                    color: Colors.white70,
-                    letterSpacing: 0,
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          title,
+                          style:
+                              Theme.of(context).textTheme.headlineSmall?.copyWith(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w900,
+                                    letterSpacing: 0,
+                                  ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          subtitle,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style:
+                              Theme.of(context).textTheme.titleSmall?.copyWith(
+                                    color: Colors.white.withValues(alpha: 0.68),
+                                    letterSpacing: 0,
+                                  ),
+                        ),
+                      ],
+                    ),
                   ),
+                ],
+              ),
             ),
             const SizedBox(height: 18),
             Expanded(child: child),

@@ -8,10 +8,10 @@ import '../widgets/status_strip.dart';
 //  DATA — derived from real ADAMS log analysis
 // ─────────────────────────────────────────────────────────
 
-const _teal = Color(0xFF00A896);
+const _teal = Color(0xFFFF9F1C);
 const _amber = Color(0xFFEF9F27);
 const _coral = Color(0xFFD85A30);
-const _purple = Color(0xFF7F77DD);
+const _purple = Color(0xFFB989FF);
 const _success = Color(0xFF3B9E3B);
 const _cardBg = Color(0x14FFFFFF);
 const _border = Color(0x1FFFFFFF);

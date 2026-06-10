@@ -100,4 +100,5 @@ six==1.17.0
 sounddevice==0.5.5
 typing_extensions==4.15.0
 urllib3==2.7.0
+firebase-admin   # already there from guardian_dart
 >>>>>>> 940a0cf6c0ed89ade5534f4aa2c4c7ea954ca7d0
