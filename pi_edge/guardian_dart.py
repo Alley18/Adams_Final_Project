@@ -11,7 +11,7 @@ Responsibilities:
   - Sends notifications (stub)
   - Writes alerts back to Firebase
   - Falls back to polling if streaming fails
-  - Shows HELP on LCD when hands leave wheel during danger state
+  - Shows HELP on LCD / matrix when hands leave wheel, regardless of emotion
 
 Usage:
     python guardian_dart.py
@@ -54,6 +54,7 @@ DATABASE_URL = os.getenv(
     "https://adams-project-final-default-rtdb.asia-southeast1.firebasedatabase.app/",
 )
 DRIVER_STATUS_PATH = os.getenv("ADAMS_DRIVER_STATUS_PATH", "/driver_status")
+USE_FIREBASE_STREAM = os.getenv("ADAMS_FIREBASE_STREAM", "0") == "1"
 
 # Danger escalation thresholds (seconds)
 ESCALATION_THRESHOLD_SECONDS = {
@@ -133,9 +134,7 @@ class GuardianDart:
         self._escalated     = False
 
         # ── Hands-off tracking ───────────────────────────
-        # Tracks when hands first left the wheel during a danger state
         self._hands_off_since  = None
-        # Prevents showing HELP repeatedly until hands return
         self._help_displayed   = False
 
         self._lock = threading.Lock()
@@ -172,7 +171,11 @@ class GuardianDart:
             self.driver_ref = db.reference(DRIVER_STATUS_PATH)
             self.alert_ref  = db.reference("/guardian_alerts")
             self.firebase_enabled = True
-            logger.info("Connected to Firebase Realtime Database")
+            logger.info(
+                "Connected to Firebase Realtime Database at %s path=%s",
+                DATABASE_URL,
+                DRIVER_STATUS_PATH,
+            )
 
         except ImportError:
             logger.error(
@@ -259,7 +262,6 @@ class GuardianDart:
                 self.hardware.show_status_on_display(state)
             else:
                 self._state_since = None
-                # Clear display when driver returns to normal
                 self.hardware.clear_display()
 
         # ── Escalation logic ─────────────────────────────
@@ -279,60 +281,57 @@ class GuardianDart:
                     f"hands={'ON' if hands else 'OFF'}"
                 )
                 send_notification(state, duration, data)
-                self._write_alert_to_firebase(state, duration, data)
+                self._write_alert_to_firebase(state, duration, data, hands)
                 self._escalated = True
 
         # ── Hands-off wheel → HELP display ───────────────
 
-        if state in DANGER_STATES:
+        if not hands:
 
-            if not hands:
+            if self._hands_off_since is None:
+                self._hands_off_since = now
+                logger.warning(f"🤚 Hands OFF wheel during {state} – starting timer")
 
-                if self._hands_off_since is None:
-                    self._hands_off_since = now
-                    logger.warning(f"🤚 Hands OFF wheel during {state} – starting timer")
+            hands_off_duration = now - self._hands_off_since
 
-                hands_off_duration = now - self._hands_off_since
+            if (
+                hands_off_duration >= HANDS_OFF_HELP_THRESHOLD_SECONDS
+                and not self._help_displayed
+            ):
+                logger.critical(
+                    f"🆘 Hands off wheel for {hands_off_duration:.1f}s "
+                    f"during {state} – HELP displayed"
+                )
 
-                if (
-                    hands_off_duration >= HANDS_OFF_HELP_THRESHOLD_SECONDS
-                    and not self._help_displayed
-                ):
-                    logger.critical(
-                        f"🆘 Hands off wheel for {hands_off_duration:.1f}s "
-                        f"during {state} – possible medical emergency!"
-                    )
+                print("\n" + "=" * 50)
+                print("  🆘  HELP TRIGGERED  🆘")
+                print(f"  STATE   : {state}")
+                print(f"  HANDS   : OFF WHEEL for {hands_off_duration:.1f}s")
+                print(f"  EMOTION : {data.get('emotion', 'UNKNOWN')}")
+                print("  ACTION  : HELP displayed on matrix/LCD")
+                print("  -> Firebase alert written")
+                print("=" * 50 + "\n")
 
-                    print("\n" + "=" * 50)
-                    print("  🆘  EMERGENCY DETECTED  🆘")
-                    print(f"  STATE   : {state}")
-                    print(f"  HANDS   : OFF WHEEL for {hands_off_duration:.1f}s")
-                    print(f"  EMOTION : {data.get('emotion', 'UNKNOWN')}")
-                    print("  ACTION  : HELP displayed on LCD")
-                    print("  -> Firebase alert written")
-                    print("=" * 50 + "\n")
+                self.hardware.buzz_alert("EMERGENCY")
+                self.hardware.show_help_on_display()
 
-                    self.hardware.buzz_alert("EMERGENCY")
-
-                    self.hardware.show_help_on_display()
-                    self._write_alert_to_firebase(
-                        state="HANDS_OFF_EMERGENCY",
-                        duration=hands_off_duration,
-                        data=data,
-                    )
-                    self._help_displayed = True
-
-            else:
-                # Hands returned to wheel – reset tracking and clear HELP
-                if self._hands_off_since is not None:
-                    logger.info("✅ Hands returned to wheel – clearing HELP display")
-                    self._hands_off_since = None
-                    self._help_displayed  = False
-                    self.hardware.show_status_on_display(state)
+                self._write_alert_to_firebase(
+                    state="HANDS_OFF_EMERGENCY",
+                    duration=hands_off_duration,
+                    data=data,
+                    hands=hands,
+                )
+                self._help_displayed = True
 
         else:
-            self._hands_off_since = None
-            self._help_displayed  = False
+            if self._hands_off_since is not None or self._help_displayed:
+                logger.info("✅ Hands returned to wheel – clearing HELP display")
+                self._hands_off_since = None
+                self._help_displayed  = False
+                if state in DANGER_STATES:
+                    self.hardware.show_status_on_display(state)
+                else:
+                    self.hardware.clear_display()
 
     # ─────────────────────────────────────────────────────
 
@@ -341,6 +340,7 @@ class GuardianDart:
         state: str,
         duration: float,
         data: dict,
+        hands: bool,
     ) -> None:
 
         if not self.firebase_enabled or self.alert_ref is None:
@@ -351,7 +351,7 @@ class GuardianDart:
                 "state":              state,
                 "duration_seconds":   round(duration, 1),
                 "emotion":            data.get("emotion"),
-                "hands_on_wheel":     data.get("hands_on_wheel"),
+                "hands_on_wheel":     hands,
                 "avg_movement":       data.get("avg_movement"),
                 "eyes_closed_frames": data.get("eyes_closed_frames"),
                 "timestamp_iso":      datetime.now(timezone.utc).isoformat(),
@@ -406,18 +406,27 @@ class GuardianDart:
         logger.info("GuardianDart listening for driver updates...")
 
         try:
-            self._listener = self.driver_ref.listen(self._on_data_change)
+            if USE_FIREBASE_STREAM:
+                self._listener = self.driver_ref.listen(self._on_data_change)
 
-            while True:
-                time.sleep(1)
+                while True:
+                    time.sleep(1)
+            else:
+                logger.info(
+                    "Firebase streaming disabled; using polling mode for Pi guardian alerts."
+                )
+                self._poll_loop()
 
         except KeyboardInterrupt:
             logger.info("GuardianDart stopped by user.")
 
         except Exception as exc:
-            logger.error(f"Streaming failed: {exc}")
-            logger.warning("Falling back to polling mode...")
-            self._poll_loop()
+            if USE_FIREBASE_STREAM:
+                logger.error(f"Streaming failed: {exc}")
+                logger.warning("Falling back to polling mode...")
+                self._poll_loop()
+            else:
+                logger.error(f"Guardian polling failed: {exc}")
 
         finally:
             try:

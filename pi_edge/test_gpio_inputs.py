@@ -1,9 +1,11 @@
 import logging
+import importlib
 import time
 from pathlib import Path
+from typing import Any
 
 try:
-    import RPi.GPIO as GPIO
+    GPIO: Any = importlib.import_module("RPi.GPIO")
 except (ImportError, RuntimeError):
     GPIO = None
 

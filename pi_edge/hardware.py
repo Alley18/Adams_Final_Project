@@ -1,15 +1,30 @@
+import importlib
 import logging
+import os
 import time
+from typing import Any
 
 try:
-    import RPi.GPIO as GPIO
+    GPIO: Any = importlib.import_module("RPi.GPIO")
 except (ImportError, RuntimeError):
     GPIO = None
 
 try:
-    from smbus2 import SMBus
+    SMBus: Any = importlib.import_module("smbus2").SMBus
 except ImportError:
     SMBus = None
+
+try:
+    from luma.core.interface.serial import spi, noop
+    from luma.core.render import canvas
+    from luma.led_matrix.device import max7219
+    from PIL import ImageFont
+except ImportError:
+    spi = None
+    noop = None
+    canvas = None
+    max7219 = None
+    ImageFont = None
 
 logger = logging.getLogger("ADAMS")
 
@@ -20,9 +35,9 @@ BUZZER_PIN = 17
 
 # FSR wired as voltage divider → GPIO digital read
 # Wire: 3.3V → FSR → junction → 10kΩ resistor → GND
-#        junction → GPIO pin 26
+#        junction -> GPIO pin 27 by default
 # When pressed: voltage rises → GPIO reads HIGH
-FSR_PIN = 26
+FSR_PIN = int(os.getenv("ADAMS_FSR_PIN", "27"))
 
 # =============================
 # LCD I2C Config
@@ -53,6 +68,14 @@ BUZZ_COOLDOWN_SECONDS = 2
 FSR_DEBOUNCE_READS  = 5       # majority vote over N reads
 FSR_DEBOUNCE_DELAY  = 0.01    # seconds between reads
 FSR_THRESHOLD_COUNT = 3       # how many HIGH reads = hand on wheel
+FSR_ACTIVE_HIGH = os.getenv("ADAMS_FSR_ACTIVE_HIGH", "1") != "0"
+FSR_LOG_INTERVAL_SECONDS = float(os.getenv("ADAMS_FSR_LOG_INTERVAL_SECONDS", "5"))
+
+MAX7219_CASCADE = int(os.getenv("ADAMS_MAX7219_CASCADE", "4"))
+MAX7219_ROTATE = int(os.getenv("ADAMS_MAX7219_ROTATE", "0"))
+MAX7219_BLOCK_ORIENTATION = int(os.getenv("ADAMS_MAX7219_BLOCK_ORIENTATION", "90"))
+MAX7219_SPI_PORT = int(os.getenv("ADAMS_MAX7219_SPI_PORT", "0"))
+MAX7219_SPI_DEVICE = int(os.getenv("ADAMS_MAX7219_SPI_DEVICE", "0"))
 
 BUZZ_PATTERNS = {
     "DISTRACTED": [(0.15, 0.10), (0.15, 0.10)],
@@ -191,9 +214,15 @@ class HardwareController:
     def __init__(self):
         self.last_buzz_time = 0.0
         self.gpio_enabled = GPIO is not None
+        self.last_fsr_sample = None
+        self._last_hands_on_wheel = None
+        self._last_fsr_log_time = 0.0
 
         # LCD is independent of GPIO
         self.lcd = LCD_I2C()
+        self.matrix = None
+        self.matrix_font = None
+        self._setup_matrix()
 
         if not self.gpio_enabled:
             logger.warning("GPIO unavailable – simulation mode")
@@ -207,11 +236,19 @@ class HardwareController:
         GPIO.output(BUZZER_PIN, GPIO.LOW)
 
         # ── FSR input ────────────────────────────────────
-        # Pull-DOWN: pin reads HIGH when FSR is pressed
-        # (voltage divider raises voltage above threshold)
-        GPIO.setup(FSR_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+        # Default wiring: pin reads HIGH when the FSR is pressed.
+        pull_mode = GPIO.PUD_DOWN if FSR_ACTIVE_HIGH else GPIO.PUD_UP
+        GPIO.setup(FSR_PIN, GPIO.IN, pull_up_down=pull_mode)
 
-        logger.info("GPIO initialised (buzzer + FSR)")
+        logger.info(
+            "GPIO initialised (buzzer + FSR): buzzer_pin=%s, fsr_pin=%s, "
+            "active_high=%s, threshold=%s/%s",
+            BUZZER_PIN,
+            FSR_PIN,
+            FSR_ACTIVE_HIGH,
+            FSR_THRESHOLD_COUNT,
+            FSR_DEBOUNCE_READS,
+        )
 
     # =============================
     # BUZZER  (unchanged logic)
@@ -219,14 +256,17 @@ class HardwareController:
 
     def buzz_alert(self, state: str = "DEFAULT") -> None:
         if not self.gpio_enabled:
+            logger.warning("Buzzer skipped: GPIO unavailable")
             return
 
         now = time.time()
         if now - self.last_buzz_time < BUZZ_COOLDOWN_SECONDS:
+            logger.debug("Buzzer skipped: cooldown active")
             return
         self.last_buzz_time = now
 
         pattern = BUZZ_PATTERNS.get(state, BUZZ_PATTERNS["DEFAULT"])
+        logger.warning("Buzzer alert: %s pattern (%s pulse(s))", state, len(pattern))
 
         try:
             for on_t, off_t in pattern:
@@ -241,6 +281,79 @@ class HardwareController:
     # FSR / WHEEL SENSOR
     # =============================
 
+    def read_fsr_sample(self) -> dict:
+        """
+        Read the force sensor with debounce and return diagnostic details.
+
+        Default wiring:
+            3.3V -> FSR -> junction -> 10k resistor -> GND
+                            junction -> GPIO 27
+
+        No pressure -> pin LOW -> hands OFF
+        Pressure    -> pin HIGH -> hands ON
+        """
+        if not self.gpio_enabled:
+            sample = {
+                "pin": FSR_PIN,
+                "reads": [],
+                "high_count": 0,
+                "low_count": 0,
+                "active_count": FSR_DEBOUNCE_READS,
+                "threshold": FSR_THRESHOLD_COUNT,
+                "active_high": FSR_ACTIVE_HIGH,
+                "hands_on": True,
+                "simulated": True,
+            }
+            self.last_fsr_sample = sample
+            return sample
+
+        reads = []
+        for _ in range(FSR_DEBOUNCE_READS):
+            reads.append(1 if GPIO.input(FSR_PIN) == GPIO.HIGH else 0)
+            time.sleep(FSR_DEBOUNCE_DELAY)
+
+        high_count = sum(reads)
+        low_count = FSR_DEBOUNCE_READS - high_count
+        active_count = high_count if FSR_ACTIVE_HIGH else low_count
+        hands_on = active_count >= FSR_THRESHOLD_COUNT
+
+        sample = {
+            "pin": FSR_PIN,
+            "reads": reads,
+            "high_count": high_count,
+            "low_count": low_count,
+            "active_count": active_count,
+            "threshold": FSR_THRESHOLD_COUNT,
+            "active_high": FSR_ACTIVE_HIGH,
+            "hands_on": hands_on,
+            "simulated": False,
+        }
+        self.last_fsr_sample = sample
+        return sample
+
+    def _log_fsr_sample(self, sample: dict) -> None:
+        hands_on = sample["hands_on"]
+        now = time.time()
+        state_changed = hands_on != self._last_hands_on_wheel
+        log_due = now - self._last_fsr_log_time >= FSR_LOG_INTERVAL_SECONDS
+
+        if not state_changed and not log_due:
+            return
+
+        self._last_hands_on_wheel = hands_on
+        self._last_fsr_log_time = now
+        logger.info(
+            "FSR hands=%s pin=%s reads=%s high=%s low=%s active=%s/%s active_high=%s",
+            "ON" if hands_on else "OFF",
+            sample["pin"],
+            sample["reads"],
+            sample["high_count"],
+            sample["low_count"],
+            sample["active_count"],
+            sample["threshold"],
+            sample["active_high"],
+        )
+
     def is_hands_on_wheel(self) -> bool:
         """
         Reads FSR pin with majority voting for debounce stability.
@@ -248,37 +361,87 @@ class HardwareController:
         Wiring assumed:
             3.3V ──[FSR]──┬──[10kΩ]── GND
                           │
-                        GPIO 26 (PUD_DOWN)
+                        GPIO 27 by default (PUD_DOWN)
 
         No pressure  → FSR very high resistance → pin stays LOW  → hands OFF
         Pressure     → FSR resistance drops    → voltage rises  → pin HIGH → hands ON
         """
-        if not self.gpio_enabled:
-            return True   # safe default in simulation
-
-        high_count = 0
-        for _ in range(FSR_DEBOUNCE_READS):
-            if GPIO.input(FSR_PIN) == GPIO.HIGH:
-                high_count += 1
-            time.sleep(FSR_DEBOUNCE_DELAY)
-
-        hands_on = high_count >= FSR_THRESHOLD_COUNT
-        logger.debug(f"FSR reads HIGH {high_count}/{FSR_DEBOUNCE_READS} → hands_on={hands_on}")
+        sample = self.read_fsr_sample()
+        self._log_fsr_sample(sample)
+        hands_on = sample["hands_on"]
         return hands_on
+
+    def read_logged_fsr_sample(self) -> dict:
+        """Read the FSR once, log changes/periodic diagnostics, and return details."""
+        sample = self.read_fsr_sample()
+        self._log_fsr_sample(sample)
+        return sample
+
+    # =============================
+    # Matrix display helpers
+    # =============================
+
+    def _setup_matrix(self) -> None:
+        if max7219 is None or spi is None or canvas is None or ImageFont is None:
+            return
+
+        try:
+            serial = spi(port=MAX7219_SPI_PORT, device=MAX7219_SPI_DEVICE, gpio=noop())
+            self.matrix = max7219(
+                serial,
+                cascaded=MAX7219_CASCADE,
+                block_orientation=MAX7219_BLOCK_ORIENTATION,
+                rotate=MAX7219_ROTATE,
+            )
+            self.matrix.clear()
+            self.matrix_font = ImageFont.load_default()
+            logger.info(
+                "MAX7219 matrix initialized: cascaded=%s rotate=%s",
+                MAX7219_CASCADE,
+                MAX7219_ROTATE,
+            )
+        except Exception as exc:
+            logger.warning("MAX7219 matrix init failed: %s", exc)
+            self.matrix = None
+
+    def _show_help_matrix(self) -> None:
+        if self.matrix is None or self.matrix_font is None:
+            return
+
+        try:
+            with canvas(self.matrix) as draw:
+                draw.rectangle((0, 0, self.matrix.width, self.matrix.height), fill="black")
+                draw.text((0, 0), "HELP", font=self.matrix_font, fill="white")
+        except Exception as exc:
+            logger.warning("Matrix HELP draw failed: %s", exc)
+            self.matrix.clear()
 
     # =============================
     # LCD convenience wrappers
     # =============================
 
     def show_help_on_display(self) -> None:
-        """Called when hands-off wheel is detected during a danger state."""
-        self.lcd.show_help()
+        """Display the HELP alert on the available status display."""
+        if self.matrix is not None:
+            self._show_help_matrix()
+        else:
+            self.lcd.show_help()
 
     def clear_display(self) -> None:
+        if self.matrix is not None:
+            try:
+                self.matrix.clear()
+            except Exception:
+                pass
         self.lcd.clear()
 
     def show_status_on_display(self, state: str) -> None:
         """Optionally show the current driver state on the LCD."""
+        if self.matrix is not None:
+            try:
+                self.matrix.clear()
+            except Exception:
+                pass
         self.lcd.show_message(f"State: {state[:14]}", "ADAMS Monitor")
 
     # =============================

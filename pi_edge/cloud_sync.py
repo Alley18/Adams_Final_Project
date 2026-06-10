@@ -22,14 +22,14 @@ SERVICE_ACCOUNT_PATH = Path(
 )
 DATABASE_URL = os.getenv(
     "ADAMS_FIREBASE_DATABASE_URL",
-    (
-        "https://adams-project-final-default-rtdb.asia-southeast1."
-        "firebasedatabase.app/"
-    ),
+    "https://adams-project-final-default-rtdb.asia-southeast1.firebasedatabase.app/",
 )
 DRIVER_STATUS_PATH = os.getenv("ADAMS_DRIVER_STATUS_PATH", "/driver_status")
 SYNC_INTERVAL_SECONDS = 2
 MAX_BACKOFF_SECONDS = 30
+
+if not isinstance(DATABASE_URL, str) or not DATABASE_URL.strip():
+    raise ValueError("ADAMS_FIREBASE_DATABASE_URL must be a non-empty string")
 
 
 class CloudSync:
