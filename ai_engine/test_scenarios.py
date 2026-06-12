@@ -1,75 +1,78 @@
+from __future__ import annotations
+
+import argparse
 import json
+import sys
 import time
-from brain import AdamsBrain
-from logger import log_event
-from voice_engine import AdamsVoice
-from ear_engine import AdamsEars
+from pathlib import Path
 
-def serious_test():
-    # 1. Initialize our components
+
+if __package__ in {None, ""}:
+    project_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(project_root))
+
+from ai_engine.brain import AdamsBrain
+from ai_engine.logger import log_event
+from ai_engine.adams_voice import AdamsVoice
+
+
+SCENARIOS = [
+    "Eye openness: 95%, Emotion: Neutral, Gaze: Forward",
+    "Eye openness: 5%, Yawning: YES, Duration: 3s",
+    "Eye openness: 85%, Emotion: Angry, Gaze: Road",
+    "Eye openness: 90%, Emotion: Happy, Gaze: Road",
+]
+
+
+def run_scenarios(use_voice: bool = False) -> None:
     adams = AdamsBrain()
-    voice = AdamsVoice()
-    ears = AdamsEars()
-    
-    # 2. Define the scenarios to test
-    live_stream = [
-        "Eye openness: 95%, Emotion: Neutral, Gaze: Forward",
-        "Eye openness: 5%, Yawning: YES, Duration: 3s",           # Sleepy Case
-        "Eye openness: 85%, Emotion: High Anger, Gaze: Road",     # Road Rage Case
-        "Eye openness: 90%, Emotion: Happy, Gaze: Road"           # Good Mood Case
-    ]
+    voice = AdamsVoice() if use_voice else None
 
-    print("🚦 ADAMS COGNITIVE MONITORING STARTING...")
-    print("="*50)
-    
-    # 3. Start the loop
-    for detection in live_stream:
-        # Get AI Logic
+    print("ADAMS cognitive monitoring smoke test")
+    print("=" * 50)
+
+    for detection in SCENARIOS:
         raw_response = adams.generate_advice(detection)
-        
-        # Log the raw data to CSV
         log_event(detection, raw_response)
-        
+
         try:
-            # Parse the AI JSON response
             data = json.loads(raw_response)
-            
-            print(f"\n[DATA]: {detection}")
-            print(f"[{data['level']}] {data['message']}")
-            
-            # --- VOICE OUTPUT ---
-            voice.say(data['message'])
+        except json.JSONDecodeError as exc:
+            print(f"Invalid JSON response for {detection!r}: {exc}")
+            continue
 
-            # --- INTERACTIVE VOICE CHECK ---
-            if data['level'] == "DANGER":
-                voice.say("You look tired. Should I find a rest stop?")
-                
-                # Listen for driver response
-                driver_answer = ears.listen()
-                
-                if "yes" in driver_answer.lower():
-                    voice.say("Searching for the nearest rest area now.")
-                elif "no" in driver_answer.lower():
-                    voice.say("Okay, but please stay alert. I will keep monitoring.")
+        level = data.get("level", "UNKNOWN")
+        message = data.get("message", "No message")
+        buzzer_active = bool(data.get("buzzer_active", False))
+        suggested_route = data.get("suggested_route", "N/A")
 
-            # --- UI OUTPUT ---
-            if 'suggested_route' in data:
-                print(f"🗺️  ROUTE: {data['suggested_route']}")
-            
-            if data['buzzer_active']:
-                print("🔊 !!! BUZZER ACTIVE !!!")
-                
-            # Test notification filtering
-            notif = adams.filter_notifications(data['level'], "New Text: Where are you?")
-            print(f"📱 {notif}")
-            
-            print("-" * 50)
+        print(f"\n[DATA] {detection}")
+        print(f"[{level}] {message}")
+        print(f"Route: {suggested_route}")
+        print(f"Buzzer active: {buzzer_active}")
+        print(adams.filter_notification(level, "New Text: Where are you?"))
+        print("-" * 50)
 
-            # Wait between cases so the voice can finish
-            time.sleep(3)
-            
-        except Exception as e:
-            print(f"Parsing Error: {e}")
+        if voice:
+            voice.alert(message) if buzzer_active else voice.speak(message)
+            voice.wait_until_done(timeout=10.0)
+
+        time.sleep(1)
+
+    if voice:
+        voice.stop()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run ADAMS AI safety smoke scenarios.")
+    parser.add_argument(
+        "--voice",
+        action="store_true",
+        help="Speak scenario messages with the Windows SAPI voice engine.",
+    )
+    args = parser.parse_args()
+    run_scenarios(use_voice=args.voice)
+
 
 if __name__ == "__main__":
-    serious_test()
+    main()

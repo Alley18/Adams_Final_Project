@@ -4,6 +4,7 @@ main_vision.py – ADAMS v3
 (Emotion engine: scored 6-state detection + rolling buffer)
 """
 
+import os
 import cv2
 import time
 import math
@@ -44,11 +45,12 @@ FACE_MISSING_DROWSY_FRAMES = 18
 HEAD_DOWN_RATIO_ACTIVATE = 0.42
 
 # -------------------------------
-# Distraction  (UNCHANGED)
+# Distraction
 # -------------------------------
 
-DISTRACTION_ANGLE = 10
-DISTRACTION_SCORE_ACTIVATE = 75
+DISTRACTION_ANGLE = int(os.getenv("ADAMS_DISTRACTION_ANGLE", "16"))
+DISTRACTION_SCORE_ACTIVATE = 60
+DISTRACTION_EXTREME_RATIO = 1.2
 
 # -------------------------------
 # Dizziness  (UNCHANGED)
@@ -59,10 +61,20 @@ DIZZY_SWAY_THRESHOLD = 6
 DIZZY_SCORE_ACTIVATE = 75
 HANDS_LOG_INTERVAL_SECONDS = 5
 FSR_SAMPLE_INTERVAL_SECONDS = 0.5
+FRAME_DELAY_SECONDS = float(os.getenv("ADAMS_FRAME_DELAY_SECONDS", "0.04"))
+HANDS_OFF_EMERGENCY_SECONDS = float(os.getenv("ADAMS_HANDS_OFF_EMERGENCY_SECONDS", "20"))
+DROWSY_EMERGENCY_SECONDS = float(os.getenv("ADAMS_DROWSY_EMERGENCY_SECONDS", "30"))
 
 # Prevent one noisy camera frame from flipping the state immediately.
-DANGER_STATE_CONFIRM_FRAMES = 4
-NORMAL_STATE_CONFIRM_FRAMES = 8
+DANGER_STATE_CONFIRM_FRAMES = 8
+NORMAL_STATE_CONFIRM_FRAMES = 18
+
+# -------------------------------
+# Camera placement
+# -------------------------------
+CAMERA_POSITION = os.getenv("ADAMS_CAMERA_POSITION", "front").lower()
+SIDE_CAMERA_BASELINE_FRAMES = int(os.getenv("ADAMS_SIDE_BASELINE_FRAMES", "30"))
+SIDE_DISTRACTION_THRESHOLD = int(os.getenv("ADAMS_SIDE_DISTRACTION_THRESHOLD", "10"))
 
 # -------------------------------
 # Emotion buffer  (NEW)
@@ -112,7 +124,7 @@ class AdamsVisionSystem:
 
         self.hardware = HardwareController()
 
-        self.hands_on_wheel = True
+        self.hands_on_wheel = False
         self.fsr_sample = {
             "hands_on": True,
             "simulated": True,
@@ -124,6 +136,12 @@ class AdamsVisionSystem:
 
         self.cloud = CloudSync()
         self.cloud.start()
+
+        self._hands_off_since = None
+        self._drowsy_since = None
+        self._emergency_active = False
+        self._emergency_trigger = ""
+        self._emergency_reason = ""
 
         self.cap = cv2.VideoCapture(CAMERA_INDEX)
 
@@ -152,8 +170,11 @@ class AdamsVisionSystem:
         self.avg_movement    = 0.0
         self.sway_score      = 0.0
         self.nose_offset     = 0.0
+        self.distraction_angle = 0.0
         self.head_down_ratio = 0.0
         self.last_nose       = None
+        self.side_baseline_nose_offsets = []
+        self.side_baseline = None
         self.movement_history = deque(maxlen=MOVEMENT_HISTORY_SIZE)
         self.state_scores = {
             "NORMAL": 100,
@@ -242,6 +263,14 @@ class AdamsVisionSystem:
                       color, -1)
 
     def update_hands_on_wheel(self, now: float) -> None:
+        if not self.hardware.gpio_enabled:
+            if not getattr(self, "_fsr_sim_warning_logged", False):
+                logger.warning(
+                    "FSR GPIO unavailable on this machine; skipping hands_on_wheel sync."
+                )
+                self._fsr_sim_warning_logged = True
+            return
+
         if now - self._last_fsr_read_time < FSR_SAMPLE_INTERVAL_SECONDS:
             return
 
@@ -249,7 +278,7 @@ class AdamsVisionSystem:
         try:
             sample = self.hardware.read_logged_fsr_sample()
             self.fsr_sample = sample
-            self.hands_on_wheel = bool(sample.get("hands_on", True))
+            self.hands_on_wheel = bool(sample.get("stable_hands_on", sample.get("hands_on", True)))
         except Exception as exc:
             logger.error(f"FSR read failed: {exc}")
             self.fsr_sample = {
@@ -257,6 +286,56 @@ class AdamsVisionSystem:
                 "error": str(exc),
                 "simulated": True,
             }
+
+    def _activate_emergency(self) -> None:
+        if self._emergency_active:
+            return
+
+        self._emergency_active = True
+        self._emergency_trigger = "DROWSY_HANDS_OFF"
+        self._emergency_reason = (
+            f"Hands off wheel >= {int(HANDS_OFF_EMERGENCY_SECONDS)}s "
+            f"and drowsy >= {int(DROWSY_EMERGENCY_SECONDS)}s"
+        )
+        logger.critical("EMERGENCY CO-PILOT: %s", self._emergency_reason)
+        self.hardware.buzz_alert("EMERGENCY")
+        self.hardware.show_help_on_display()
+
+    def _deactivate_emergency(self) -> None:
+        if not self._emergency_active:
+            return
+
+        self._emergency_active = False
+        self._emergency_trigger = ""
+        self._emergency_reason = ""
+        logger.info("Emergency Co-Pilot cleared")
+        if self.hardware.matrix is not None:
+            self.hardware.show_status_on_display(self.driver_state)
+        else:
+            self.hardware.clear_display()
+
+    def update_emergency_context(self, now: float) -> None:
+        if self.hands_on_wheel:
+            self._hands_off_since = None
+        elif self._hands_off_since is None:
+            self._hands_off_since = now
+
+        if self.driver_state == "DROWSY":
+            self._drowsy_since = self._drowsy_since or now
+        else:
+            self._drowsy_since = None
+
+        if (
+            self._hands_off_since is not None
+            and self._drowsy_since is not None
+            and now - self._hands_off_since >= HANDS_OFF_EMERGENCY_SECONDS
+            and now - self._drowsy_since >= DROWSY_EMERGENCY_SECONDS
+        ):
+            self._activate_emergency()
+        elif self._emergency_active and (
+            self.hands_on_wheel or self.driver_state != "DROWSY"
+        ):
+            self._deactivate_emergency()
 
     def draw_system_display(self, frame, ear: float) -> None:
         state_color = {
@@ -314,10 +393,34 @@ class AdamsVisionSystem:
             330,
             (255, 255, 0),
         )
+        self.draw_small_text(
+            frame,
+            (
+                f"DIST_ANGLE {self.distraction_angle:.1f} | BASE {self.side_baseline if self.side_baseline is not None else 0:.1f}"
+            ),
+            350,
+            (255, 180, 0),
+        )
+        if self._emergency_active:
+            self.draw_text(
+                frame,
+                "EMERGENCY CO-PILOT ACTIVE",
+                390,
+                (0, 0, 255),
+            )
 
     @staticmethod
     def clamp_percent(value: float) -> int:
         return int(max(0, min(100, round(value))))
+
+    def get_distraction_offset(self) -> float:
+        if not self.face_detected:
+            return 0.0
+        if CAMERA_POSITION == "front":
+            return abs(self.nose_offset)
+        if CAMERA_POSITION == "side" and self.side_baseline is not None:
+            return abs(self.nose_offset - self.side_baseline)
+        return 0.0
 
     def calculate_state_scores(self, ear: float) -> dict[str, int]:
         """
@@ -326,6 +429,8 @@ class AdamsVisionSystem:
         or hidden eyes are common when a driver is falling asleep.
         """
         drowsy_score = 0.0
+        self.distraction_angle = distraction_angle = self.get_distraction_offset()
+        rotation_is_extreme = distraction_angle >= DISTRACTION_ANGLE * DISTRACTION_EXTREME_RATIO
 
         if self.face_detected:
             closed_frame_score = (
@@ -340,10 +445,18 @@ class AdamsVisionSystem:
                 ear_score = 30 + ((EAR_DROOPY_THRESHOLD - ear) / droopy_range) * 25
 
             eyes_missing_score = 0.0
-            if self.eye_count == 0:
-                eyes_missing_score = (
-                    self.eyes_missing_frames / max(1, EYES_MISSING_DROWSY_FRAMES)
-                ) * 90
+            if self.eye_count < 2:
+                if self.eye_count == 0:
+                    if rotation_is_extreme and self.head_down_ratio < HEAD_DOWN_RATIO_ACTIVATE * 0.75:
+                        # Eyes are likely hidden by an extreme head turn,
+                        # so do not treat this as automatic drowsiness.
+                        eyes_missing_score = 20
+                    else:
+                        eyes_missing_score = 80
+                else:
+                    eyes_missing_score = 45
+                if self.head_down_ratio >= HEAD_DOWN_RATIO_ACTIVATE * 0.75:
+                    eyes_missing_score = max(eyes_missing_score, 90)
 
             head_down_score = 0.0
             if self.head_down_ratio >= HEAD_DOWN_RATIO_ACTIVATE:
@@ -375,20 +488,26 @@ class AdamsVisionSystem:
         drowsy_evidence_is_strong = (
             drowsy_score >= 60
             or self.eyes_closed_frames >= DROWSY_FRAME_LIMIT * 0.4
-            or self.eyes_missing_frames >= EYES_MISSING_DROWSY_FRAMES
+            or (self.eye_count == 0 and self.eyes_missing_frames >= EYES_MISSING_DROWSY_FRAMES and not rotation_is_extreme)
             or self.head_down_ratio >= HEAD_DOWN_RATIO_ACTIVATE
         )
-        if self.face_detected and self.eye_count >= 1 and not drowsy_evidence_is_strong:
-            angle = abs(self.nose_offset)
-            if angle >= DISTRACTION_ANGLE:
+        distraction_ready = (
+            self.face_detected
+            and distraction_angle >= DISTRACTION_ANGLE * 0.9
+            and self.head_down_ratio < HEAD_DOWN_RATIO_ACTIVATE * 0.9
+        )
+
+        if distraction_ready and not drowsy_evidence_is_strong:
+            if rotation_is_extreme:
+                distraction_score = 100
+            elif distraction_angle >= DISTRACTION_ANGLE:
                 distraction_score = 65 + (
-                    (angle - DISTRACTION_ANGLE) / max(1, DISTRACTION_ANGLE)
+                    (distraction_angle - DISTRACTION_ANGLE) / max(1, DISTRACTION_ANGLE)
                 ) * 35
-            elif angle >= DISTRACTION_ANGLE * 0.7:
-                distraction_score = 35 + (
-                    (angle - (DISTRACTION_ANGLE * 0.7))
-                    / max(1, DISTRACTION_ANGLE * 0.3)
-                ) * 25
+            elif distraction_angle >= DISTRACTION_ANGLE * 0.8:
+                distraction_score = 40 + (
+                    (distraction_angle - DISTRACTION_ANGLE * 0.8) / max(1, DISTRACTION_ANGLE * 0.2)
+                ) * 45
 
         dizzy_score = 0.0
         if self.sway_score >= DIZZY_SWAY_THRESHOLD:
@@ -467,7 +586,7 @@ class AdamsVisionSystem:
     def calculate_emotion_scores(self, ear: float) -> dict[str, int]:
         tired_score = self.state_scores.get("DROWSY", 0)
         stressed_score = self.state_scores.get("DIZZY", 0)
-        neutral_score = 45 if self.face_detected else 80
+        neutral_score = 50 if self.face_detected else 80
         focused_score = 0
         relaxed_score = 0
         happy_score = 0
@@ -480,14 +599,27 @@ class AdamsVisionSystem:
 
         if self.face_detected and top_danger_score < 60:
             if self.eye_count >= 2:
-                focused_score = 75 if ear <= 0.31 else 55
-                happy_score = 65 if ear > 0.31 and self.sway_score < 2.5 else 0
-                relaxed_score = 55 if ear >= 0.24 and self.sway_score < 3.0 else 35
+                if ear >= 0.28 and self.sway_score < 2.5:
+                    focused_score = 75
+                elif ear >= 0.24 and self.sway_score < 3.0:
+                    focused_score = 60
+                else:
+                    focused_score = 45
+
+                if ear > 0.30 and self.sway_score < 2.0:
+                    happy_score = 60
+
+                if ear >= 0.24 and self.sway_score < 2.8:
+                    relaxed_score = 65
+                elif ear >= 0.20:
+                    relaxed_score = 40
             elif self.eye_count == 1:
                 relaxed_score = 60
 
         if self.state_scores.get("DISTRACTED", 0) >= DISTRACTION_SCORE_ACTIVATE:
             neutral_score = max(neutral_score, 60)
+            focused_score = min(focused_score, 50)
+            relaxed_score = max(relaxed_score, 45)
 
         if tired_score >= 70:
             neutral_score = min(neutral_score, 35)
@@ -620,7 +752,8 @@ class AdamsVisionSystem:
     # =====================================================
 
     def sync_to_cloud(self):
-        self.cloud.update_data({
+        now = time.time()
+        payload = {
             "driver_state":      self.driver_state,
             "state_confidence":  self.state_confidence,
             "state_scores":      self.state_scores,
@@ -642,8 +775,22 @@ class AdamsVisionSystem:
             "eyes_missing_frames": self.eyes_missing_frames,
             "eyes_closed_frames": self.eyes_closed_frames,
             "hands_on_wheel":    self.hands_on_wheel,
+            "emergency_active":  self._emergency_active,
+            "emergency_trigger": self._emergency_trigger,
+            "emergency_reason":  self._emergency_reason,
+            "hands_off_duration": round(now - self._hands_off_since, 1)
+            if self._hands_off_since is not None
+            else 0.0,
+            "drowsy_duration": round(now - self._drowsy_since, 1)
+            if self._drowsy_since is not None
+            else 0.0,
             "timestamp":         time.time(),
-        })
+        }
+
+        if self.hardware.gpio_enabled:
+            payload["hands_on_wheel"] = self.hands_on_wheel
+
+        self.cloud.update_data(payload)
 
     # =====================================================
     # Main Loop  (danger detection section UNCHANGED)
@@ -704,6 +851,16 @@ class AdamsVisionSystem:
                     right_face = landmarks[454]
                     face_center_x = (left_face[0] + right_face[0]) / 2
                     self.nose_offset = nose[0] - face_center_x
+                    if CAMERA_POSITION == "side":
+                        if self.side_baseline is None:
+                            self.side_baseline_nose_offsets.append(self.nose_offset)
+                            if len(self.side_baseline_nose_offsets) >= SIDE_CAMERA_BASELINE_FRAMES:
+                                self.side_baseline = float(
+                                    np.mean(self.side_baseline_nose_offsets)
+                                )
+                                logger.info(
+                                    f"SIDE camera baseline nose_offset={self.side_baseline:.2f}"
+                                )
 
                     forehead = landmarks[10]
                     chin = landmarks[152]
@@ -754,15 +911,16 @@ class AdamsVisionSystem:
                 # APPLY DANGER STATE  (UNCHANGED)
                 # ==============================================
 
+                now = time.time()
                 candidate_state = self.choose_candidate_state(ear)
                 self.set_state(candidate_state)
                 self.update_state_context()
+                self.update_emergency_context(now)
 
                 # ==============================================
                 # EMOTION  (new 6-state engine + buffer)
                 # ==============================================
 
-                now          = time.time()
                 self.set_emotion(self.detect_emotion(ear))
                 self.update_emotion_buffer(now)
 
@@ -788,6 +946,7 @@ class AdamsVisionSystem:
                 frame = cv2.resize(frame, (720, 540))
                 cv2.imshow("ADAMS SYSTEM", frame)
 
+                time.sleep(FRAME_DELAY_SECONDS)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 

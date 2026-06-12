@@ -11,18 +11,24 @@ Responsibilities:
   - Sends notifications (stub)
   - Writes alerts back to Firebase
   - Falls back to polling if streaming fails
-  - Shows HELP on LCD / matrix when hands leave wheel, regardless of emotion
+  - Shows HELP on LCD / matrix when hands leave wheel for 30s
 
-Usage:
-    python guardian_dart.py
+FIX: Dedicated FSR push thread writes hands_on_wheel every 200ms
+     independently of the main poll loop, so mobile sees near-instant
+     on/off changes without waiting for the full poll cycle.
 
-Requirements:
-    pip install firebase-admin requests smbus2
+FIX: Live status thread writes full guardian_live node every second so
+     mobile always has a real-time view of the current state + hands.
 
-Place:
-    serviceAccountKey.json
+FIX: Internet check moved to its own background thread so it never
+     blocks the FSR push loop or the poll loop (hardware always responds).
 
-in the same directory as this file.
+FIX: HANDS_OFF_HELP_THRESHOLD_SECONDS raised to 30.0 (was 3.0).
+
+FIX: Hands-off timer no longer resets on state transitions (DIZZY →
+     DISTRACTED → DIZZY was resetting the timer every ~2s, preventing
+     HELP from ever triggering). The timer now only resets when the
+     driver actually puts their hands back on the wheel.
 """
 
 import logging
@@ -53,14 +59,14 @@ DATABASE_URL = os.getenv(
     "ADAMS_FIREBASE_DATABASE_URL",
     "https://adams-project-final-default-rtdb.asia-southeast1.firebasedatabase.app/",
 )
-DRIVER_STATUS_PATH = os.getenv("ADAMS_DRIVER_STATUS_PATH", "/driver_status")
+DRIVER_STATUS_PATH  = os.getenv("ADAMS_DRIVER_STATUS_PATH", "/driver_status")
 USE_FIREBASE_STREAM = os.getenv("ADAMS_FIREBASE_STREAM", "0") == "1"
 
 # Danger escalation thresholds (seconds)
 ESCALATION_THRESHOLD_SECONDS = {
-    "DISTRACTED": 8.0,
-    "DIZZY":      6.0,
-    "DROWSY":     10.0,
+    "DISTRACTED": 1.0,
+    "DIZZY":      1.0,
+    "DROWSY":     1.0,
 }
 
 DANGER_STATES = {
@@ -69,8 +75,17 @@ DANGER_STATES = {
     "DROWSY",
 }
 
-# How long hands must be off wheel (during danger) before HELP is shown
-HANDS_OFF_HELP_THRESHOLD_SECONDS = 3.0
+# FIX: Raised from 3.0 to 30.0 — HELP should only trigger after the
+# driver has had their hands off the wheel for a full 30 seconds.
+HANDS_OFF_HELP_THRESHOLD_SECONDS = float(
+    os.getenv("ADAMS_HANDS_OFF_HELP_THRESHOLD", "30.0")
+)
+
+# Thread intervals (tunable via env vars)
+FSR_PUSH_INTERVAL       = float(os.getenv("ADAMS_FSR_PUSH_INTERVAL",   "0.2"))  # hands update
+POLL_INTERVAL           = float(os.getenv("ADAMS_POLL_INTERVAL",        "0.3"))  # driver state
+LIVE_STATUS_INTERVAL    = float(os.getenv("ADAMS_LIVE_STATUS_INTERVAL", "1.0"))  # live node
+INTERNET_CHECK_INTERVAL = float(os.getenv("ADAMS_INTERNET_CHECK_INTERVAL", "1.0"))  # connectivity
 
 # ─────────────────────────────────────────────────────────────
 # Logging
@@ -124,34 +139,41 @@ class GuardianDart:
     def __init__(self):
 
         self.firebase_enabled = False
-        self.driver_ref  = None
-        self.alert_ref   = None
-        self._listener   = None
+        self.driver_ref = None
+        self.alert_ref  = None
+        self.live_ref   = None   # /guardian_live — updated every second
+        self._listener  = None
 
         self._current_state = "NORMAL"
         self._state_since   = None
         self._last_data     = {}
         self._escalated     = False
 
-        # ── Hands-off tracking ───────────────────────────
-        self._hands_off_since  = None
-        self._help_displayed   = False
+        # Hands-off tracking
+        # FIX: _hands_off_since is now ONLY reset when hands return to wheel.
+        # Previously it was reset on every state transition, so rapid
+        # DIZZY→DISTRACTED→DIZZY flips would restart the 30s timer each time
+        # and HELP could never trigger.
+        self._hands_off_since = None
+        self._help_displayed  = False
+
+        # Latest FSR reading shared between threads
+        self._latest_hands_on = True
+        self._fsr_lock = threading.Lock()
+
+        # Internet flag updated by background thread
+        self._internet_ok   = True
+        self._internet_lock = threading.Lock()
 
         self._lock = threading.Lock()
 
+        # Hardware init
         self.hardware = HardwareController()
 
         self._connect_firebase()
 
     # ─────────────────────────────────────────────────────
-
-    def _internet_available(self) -> bool:
-        try:
-            requests.get("https://google.com", timeout=3)
-            return True
-        except Exception:
-            return False
-
+    # Firebase
     # ─────────────────────────────────────────────────────
 
     def _connect_firebase(self) -> None:
@@ -170,6 +192,7 @@ class GuardianDart:
 
             self.driver_ref = db.reference(DRIVER_STATUS_PATH)
             self.alert_ref  = db.reference("/guardian_alerts")
+            self.live_ref   = db.reference("/guardian_live")
             self.firebase_enabled = True
             logger.info(
                 "Connected to Firebase Realtime Database at %s path=%s",
@@ -185,6 +208,120 @@ class GuardianDart:
         except Exception as exc:
             logger.error(f"Firebase connection failed: {exc}")
 
+    # ─────────────────────────────────────────────────────
+    # Internet check thread — non-blocking, every 5s
+    # ─────────────────────────────────────────────────────
+
+    def _internet_check_loop(self, interval: float = INTERNET_CHECK_INTERVAL) -> None:
+        """
+        Runs internet check in its own thread so it never blocks the
+        FSR push loop or the poll loop. Hardware always responds.
+        """
+        while True:
+            try:
+                requests.get("https://google.com", timeout=3)
+                ok = True
+            except Exception:
+                ok = False
+
+            with self._internet_lock:
+                if ok != self._internet_ok:
+                    logger.info("Internet: %s", "ONLINE" if ok else "OFFLINE")
+                self._internet_ok = ok
+
+            time.sleep(interval)
+
+    def _is_internet_ok(self) -> bool:
+        with self._internet_lock:
+            return self._internet_ok
+
+    # ─────────────────────────────────────────────────────
+    # FSR push thread — 200ms, hands_on_wheel
+    # ─────────────────────────────────────────────────────
+
+    def _fsr_push_loop(self, interval: float = FSR_PUSH_INTERVAL) -> None:
+        """
+        Reads the physical button every 200ms and pushes hands_on_wheel
+        to Firebase so mobile sees near-instant on/off changes.
+        Runs independently of the poll/stream loop.
+        """
+        logger.info("FSR push loop started (%.2fs interval)", interval)
+
+        while True:
+            try:
+                hands = self.hardware.is_hands_on_wheel()
+
+                # Share with main thread
+                with self._fsr_lock:
+                    self._latest_hands_on = hands
+
+                # Write to same key the working version used
+                if self.driver_ref and self._is_internet_ok():
+                    self.driver_ref.update({"hands_on_wheel": hands})
+
+            except Exception as exc:
+                logger.error(f"FSR push error: {exc}")
+
+            time.sleep(interval)
+
+    # ─────────────────────────────────────────────────────
+    # Live status thread — 1s, /guardian_live
+    # ─────────────────────────────────────────────────────
+
+    def _live_status_loop(self, interval: float = LIVE_STATUS_INTERVAL) -> None:
+        """
+        Writes the full current guardian state to /guardian_live every second.
+        Mobile app listens to this node for a real-time dashboard.
+        """
+        logger.info("Live status loop started (%.1fs interval)", interval)
+
+        while True:
+            try:
+                if self.live_ref and self._is_internet_ok():
+
+                    with self._lock:
+                        data = self._last_data.copy()
+
+                    with self._fsr_lock:
+                        hands = self._latest_hands_on
+
+                    now = time.time()
+
+                    danger_duration = None
+                    if (
+                        self._current_state in DANGER_STATES
+                        and self._state_since is not None
+                    ):
+                        danger_duration = round(now - self._state_since, 1)
+
+                    hands_off_duration = None
+                    if self._hands_off_since is not None:
+                        hands_off_duration = round(now - self._hands_off_since, 1)
+
+                    live_payload = {
+                        "driver_state":         self._current_state,
+                        "hands_on_wheel":       hands,
+                        "emotion":              data.get("emotion", "UNKNOWN"),
+                        "avg_movement":         data.get("avg_movement"),
+                        "eyes_closed_frames":   data.get("eyes_closed_frames"),
+                        "danger_duration_s":    danger_duration,
+                        "hands_off_duration_s": hands_off_duration,
+                        "help_displayed":       self._help_displayed,
+                        "escalated":            self._escalated,
+                        "hands_off_threshold_s": HANDS_OFF_HELP_THRESHOLD_SECONDS,
+                        "timestamp_iso":        datetime.now(timezone.utc).isoformat(),
+                        "timestamp_epoch":      now,
+                    }
+
+                    self.live_ref.set(live_payload)
+
+            except Exception as exc:
+                logger.error(f"Live status write error: {exc}")
+
+            time.sleep(interval)
+
+    # ─────────────────────────────────────────────────────
+    # Stream callback
     # ─────────────────────────────────────────────────────
 
     def _on_data_change(self, event) -> None:
@@ -206,17 +343,17 @@ class GuardianDart:
             state   = data.get("driver_state", "NORMAL")
             emotion = data.get("emotion", "UNKNOWN")
 
-            # Always read FSR directly from the Pi hardware.
-            # Do NOT use data.get("hands_on_wheel") — that value
-            # is written by the laptop which has no GPIO and
-            # always sends True.
-            hands = self.hardware.is_hands_on_wheel()
+            # Use latest FSR value already read by the push thread
+            with self._fsr_lock:
+                hands = self._latest_hands_on
 
             self._handle_state(state, emotion, hands, data)
 
         except Exception as exc:
             logger.error(f"Stream callback error: {exc}")
 
+    # ─────────────────────────────────────────────────────
+    # State handler
     # ─────────────────────────────────────────────────────
 
     def _handle_state(
@@ -228,15 +365,6 @@ class GuardianDart:
     ) -> None:
 
         now = time.time()
-
-        # Update Firebase with REAL Pi FSR value
-        try:
-            if self.driver_ref:
-                self.driver_ref.update({
-                    "hands_on_wheel": hands
-                })
-        except Exception as exc:
-            logger.error(f"Failed updating hands_on_wheel: {exc}")
 
         # ── State transition ──────────────────────────────
 
@@ -251,9 +379,11 @@ class GuardianDart:
             self._current_state = state
             self._escalated     = False
 
-            # Reset hands-off tracking on every state change
-            self._hands_off_since = None
-            self._help_displayed  = False
+            # FIX: Do NOT reset _hands_off_since or _help_displayed here.
+            # Rapid state flips (DIZZY→DISTRACTED→DIZZY every ~2s) were
+            # resetting the hands-off timer on each transition, making it
+            # impossible to ever reach the 30s threshold.
+            # The timer now only resets when hands physically return to wheel.
 
             if state in DANGER_STATES:
                 self._state_since = now
@@ -288,11 +418,22 @@ class GuardianDart:
 
         if not hands:
 
+            # Start the timer only once — do not reset on state changes
             if self._hands_off_since is None:
                 self._hands_off_since = now
-                logger.warning(f"🤚 Hands OFF wheel during {state} – starting timer")
+                logger.warning(
+                    f"🤚 Hands OFF wheel during {state} – "
+                    f"HELP in {HANDS_OFF_HELP_THRESHOLD_SECONDS:.0f}s"
+                )
 
             hands_off_duration = now - self._hands_off_since
+
+            # Log progress every 5 seconds so it's easy to track in the log
+            if int(hands_off_duration) % 5 == 0 and int(hands_off_duration) > 0:
+                logger.info(
+                    f"🤚 Hands still OFF wheel: {hands_off_duration:.1f}s / "
+                    f"{HANDS_OFF_HELP_THRESHOLD_SECONDS:.0f}s"
+                )
 
             if (
                 hands_off_duration >= HANDS_OFF_HELP_THRESHOLD_SECONDS
@@ -324,8 +465,16 @@ class GuardianDart:
                 self._help_displayed = True
 
         else:
+            # Hands are back on wheel — now it's safe to reset the timer
             if self._hands_off_since is not None or self._help_displayed:
-                logger.info("✅ Hands returned to wheel – clearing HELP display")
+                off_duration = (
+                    round(now - self._hands_off_since, 1)
+                    if self._hands_off_since is not None
+                    else 0.0
+                )
+                logger.info(
+                    f"✅ Hands returned to wheel after {off_duration}s – clearing HELP display"
+                )
                 self._hands_off_since = None
                 self._help_displayed  = False
                 if state in DANGER_STATES:
@@ -364,15 +513,17 @@ class GuardianDart:
             logger.error(f"Failed writing alert: {exc}")
 
     # ─────────────────────────────────────────────────────
+    # Poll loop
+    # ─────────────────────────────────────────────────────
 
-    def _poll_loop(self, interval: float = 1.5) -> None:
+    def _poll_loop(self, interval: float = POLL_INTERVAL) -> None:
 
         logger.info(f"Polling Firebase every {interval}s")
 
         while True:
             try:
-                if not self._internet_available():
-                    logger.warning("No internet connection...")
+                if not self._is_internet_ok():
+                    logger.warning("No internet connection – skipping poll")
                     time.sleep(interval)
                     continue
 
@@ -385,8 +536,9 @@ class GuardianDart:
                     state   = data.get("driver_state", "NORMAL")
                     emotion = data.get("emotion", "UNKNOWN")
 
-                    # Read FSR directly from Pi hardware
-                    hands = self.hardware.is_hands_on_wheel()
+                    # Use latest FSR value from push thread
+                    with self._fsr_lock:
+                        hands = self._latest_hands_on
 
                     self._handle_state(state, emotion, hands, data)
 
@@ -396,6 +548,8 @@ class GuardianDart:
             time.sleep(interval)
 
     # ─────────────────────────────────────────────────────
+    # Run
+    # ─────────────────────────────────────────────────────
 
     def run(self) -> None:
 
@@ -403,12 +557,42 @@ class GuardianDart:
             logger.error("Firebase not connected.")
             return
 
-        logger.info("GuardianDart listening for driver updates...")
+        logger.info("GuardianDart starting all background threads...")
+        logger.info(
+            "Hands-off HELP threshold: %.0fs", HANDS_OFF_HELP_THRESHOLD_SECONDS
+        )
+
+        threads = [
+            # Internet check — non-blocking, every 5s
+            threading.Thread(
+                target=self._internet_check_loop,
+                args=(INTERNET_CHECK_INTERVAL,),
+                daemon=True,
+                name="internet-check",
+            ),
+            # FSR push — hands_on_wheel every 200ms
+            threading.Thread(
+                target=self._fsr_push_loop,
+                args=(FSR_PUSH_INTERVAL,),
+                daemon=True,
+                name="fsr-push",
+            ),
+            # Live status — full guardian_live node every 1s
+            threading.Thread(
+                target=self._live_status_loop,
+                args=(LIVE_STATUS_INTERVAL,),
+                daemon=True,
+                name="live-status",
+            ),
+        ]
+
+        for t in threads:
+            t.start()
+            logger.info("Thread started: %s", t.name)
 
         try:
             if USE_FIREBASE_STREAM:
                 self._listener = self.driver_ref.listen(self._on_data_change)
-
                 while True:
                     time.sleep(1)
             else:

@@ -17,7 +17,9 @@ class GuardianScreen extends StatefulWidget {
 
 class _GuardianScreenState extends State<GuardianScreen> {
   static const _repeatWarningInterval = Duration(seconds: 12);
-  static const _alertChannel = MethodChannel('adams/guardian_alerts');
+
+  static const MethodChannel _alertChannel =
+      MethodChannel('adams/guardian_alerts');
 
   final FlutterTts tts = FlutterTts();
 
@@ -49,6 +51,7 @@ class _GuardianScreenState extends State<GuardianScreen> {
     required bool handsOnWheel,
     required bool isDanger,
   }) {
+    // Reset warning cooldown when safe
     if (!isDanger) {
       _lastWarningKey = null;
       _lastWarningAt = null;
@@ -57,10 +60,14 @@ class _GuardianScreenState extends State<GuardianScreen> {
 
     final warningKey = '$driverState|$handsOnWheel';
     final now = DateTime.now();
-    final shouldRepeat = _lastWarningAt == null ||
-        now.difference(_lastWarningAt!) >= _repeatWarningInterval;
 
-    if (_lastWarningKey == warningKey && !shouldRepeat) {
+    final shouldRepeat = _lastWarningAt == null ||
+        now.difference(_lastWarningAt!) >=
+            _repeatWarningInterval;
+
+    // Avoid repeating same warning too frequently
+    if (_lastWarningKey == warningKey &&
+        !shouldRepeat) {
       return;
     }
 
@@ -69,15 +76,21 @@ class _GuardianScreenState extends State<GuardianScreen> {
 
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted) return;
+
       await _vibrateAlert();
+
       await tts.stop();
-      await tts.speak(_warningText(driverState, handsOnWheel));
+      await tts.speak(
+        _warningText(driverState, handsOnWheel),
+      );
     });
   }
 
   Future<void> _vibrateAlert() async {
     try {
-      await _alertChannel.invokeMethod<void>('vibrateAlert');
+      await _alertChannel.invokeMethod<void>(
+        'vibrateAlert',
+      );
     } on PlatformException {
       await HapticFeedback.vibrate();
       await HapticFeedback.heavyImpact();
@@ -87,8 +100,12 @@ class _GuardianScreenState extends State<GuardianScreen> {
     }
   }
 
-  String _warningText(String driverState, bool handsOnWheel) {
-    if (!handsOnWheel && driverState != 'NORMAL') {
+  String _warningText(
+    String driverState,
+    bool handsOnWheel,
+  ) {
+    if (!handsOnWheel &&
+        driverState != 'NORMAL') {
       return 'Guardian alert. Driver is $driverState and hands are off the wheel.';
     }
 
@@ -99,22 +116,42 @@ class _GuardianScreenState extends State<GuardianScreen> {
     return 'Guardian alert. Driver state is $driverState.';
   }
 
+  bool _parseBool(dynamic value) {
+    if (value is bool) return value;
+
+    if (value is String) {
+      return value.toLowerCase() == 'true';
+    }
+
+    if (value is int) {
+      return value != 0;
+    }
+
+    return false;
+  }
+
   @override
   Widget build(BuildContext context) {
     return FutureBuilder(
       future: FirebaseBootstrap.initialize(),
-      builder: (context, firebaseSnapshot) {
-        if (firebaseSnapshot.connectionState != ConnectionState.done) {
+      builder: (
+        context,
+        firebaseSnapshot,
+      ) {
+        if (firebaseSnapshot.connectionState !=
+            ConnectionState.done) {
           return const _MessageScaffold(
             child: CircularProgressIndicator(),
           );
         }
 
         final app = firebaseSnapshot.data;
+
         if (app == null) {
           return _MessageScaffold(
             child: Padding(
-              padding: const EdgeInsets.all(24),
+              padding:
+                  const EdgeInsets.all(24),
               child: Text(
                 'Firebase is not configured yet.\n\n'
                 '${FirebaseBootstrap.lastError ?? 'Add Firebase settings to .env.'}',
@@ -124,89 +161,184 @@ class _GuardianScreenState extends State<GuardianScreen> {
           );
         }
 
-        final configuredDatabaseUrl = FirebaseBootstrap.databaseUrl;
-        final database = configuredDatabaseUrl.isEmpty
-            ? FirebaseDatabase.instanceFor(app: app)
-            : FirebaseDatabase.instanceFor(
-                app: app,
-                databaseURL: configuredDatabaseUrl,
-              );
-        final dbRef = database.ref("driver_status");
+        final configuredDatabaseUrl =
+            FirebaseBootstrap.databaseUrl;
+
+        final database =
+            configuredDatabaseUrl.isEmpty
+                ? FirebaseDatabase.instanceFor(
+                    app: app,
+                  )
+                : FirebaseDatabase.instanceFor(
+                    app: app,
+                    databaseURL:
+                        configuredDatabaseUrl,
+                  );
+
+        // FIXED:
+        // Listen to guardian_live
+        // NOT driver_status
+        final dbRef =
+            database.ref('guardian_live');
 
         return StreamBuilder<DatabaseEvent>(
           stream: dbRef.onValue,
-          builder: (context, snapshot) {
-            // -----------------------------
-            // Loading
-            // -----------------------------
+          builder: (
+            context,
+            snapshot,
+          ) {
+            if (snapshot.hasError) {
+              return _MessageScaffold(
+                child: Text(
+                  'Firebase error:\n${snapshot.error}',
+                  textAlign:
+                      TextAlign.center,
+                ),
+              );
+            }
+
             if (!snapshot.hasData) {
               return const _MessageScaffold(
-                child: CircularProgressIndicator(),
+                child:
+                    CircularProgressIndicator(),
               );
             }
 
-            // -----------------------------
-            // Firebase data
-            // -----------------------------
-            final data =
-                snapshot.data!.snapshot.value as Map<dynamic, dynamic>?;
+            final rawValue = snapshot
+                .data
+                ?.snapshot
+                .value;
 
-            // Debug print
-            debugPrint(data.toString());
-
-            // -----------------------------
-            // No data
-            // -----------------------------
-            if (data == null) {
-              return const _MessageScaffold(
-                child: Text("No Firebase data"),
-              );
-            }
-
-            // -----------------------------
-            // Read values safely
-            // -----------------------------
-            final driverState = data['driver_state']?.toString() ?? 'UNKNOWN';
-
-            final handsOnWheelRaw = data['hands_on_wheel'];
-
-            bool handsOnWheel = true;
-
-            if (handsOnWheelRaw is bool) {
-              handsOnWheel = handsOnWheelRaw;
-            } else if (handsOnWheelRaw is String) {
-              handsOnWheel = handsOnWheelRaw.toLowerCase() == 'true';
-            }
-
-            final isDanger = driverState != 'NORMAL' || !handsOnWheel;
-            _handleWarning(
-              driverState: driverState,
-              handsOnWheel: handsOnWheel,
-              isDanger: isDanger,
+            debugPrint(
+              'FIREBASE RAW: $rawValue',
             );
 
-            // -----------------------------
-            // UI
-            // -----------------------------
+            final data =
+                rawValue
+                    as Map<dynamic, dynamic>?;
+
+            if (data == null) {
+              return const _MessageScaffold(
+                child:
+                    Text('No Firebase data'),
+              );
+            }
+
+            debugPrint(
+              'FIREBASE DATA: $data',
+            );
+
+            // guardian_live fields
+            final driverState =
+                data['driver_state']
+                        ?.toString() ??
+                    'UNKNOWN';
+
+            final handsOnWheel =
+                _parseBool(
+              data['hands_on_wheel'],
+            );
+
+            final dangerDuration =
+                data[
+                    'danger_duration_s'];
+
+            final handsOffDuration =
+                data[
+                    'hands_off_duration_s'];
+
+            final escalated =
+                _parseBool(
+              data['escalated'],
+            );
+
+            final helpDisplayed =
+                _parseBool(
+              data['help_displayed'],
+            );
+
+            final isDanger =
+                driverState !=
+                        'NORMAL' ||
+                    !handsOnWheel;
+
+            _handleWarning(
+              driverState:
+                  driverState,
+              handsOnWheel:
+                  handsOnWheel,
+              isDanger:
+                  isDanger,
+            );
+
             return ScreenFrame(
               title: 'Guardian',
-              subtitle: driverState,
-              backgroundColor: isDanger ? const Color(0xFF8B0000) : null,
+              subtitle:
+                  driverState,
+              backgroundColor:
+                  isDanger
+                      ? const Color(
+                          0xFF8B0000)
+                      : null,
               child: Column(
                 children: [
                   Expanded(
                     child: Center(
-                      child: BigCircleButton(
-                        icon: isDanger
-                            ? Icons.warning_amber_rounded
-                            : Icons.favorite,
-                        label: isDanger ? 'ALERT' : 'OK',
-                        color: isDanger
-                            ? const Color(0xFFE6B325)
-                            : const Color(0xFF24B47E),
+                      child:
+                          BigCircleButton(
+                        icon:
+                            isDanger
+                                ? Icons
+                                    .warning_amber_rounded
+                                : Icons
+                                    .favorite,
+                        label:
+                            isDanger
+                                ? 'ALERT'
+                                : 'OK',
+                        color:
+                            isDanger
+                                ? const Color(
+                                    0xFFE6B325)
+                                : const Color(
+                                    0xFF24B47E),
                       ),
                     ),
                   ),
+
+                  // Live guardian info
+                  Padding(
+                    padding:
+                        const EdgeInsets
+                            .symmetric(
+                      horizontal: 16,
+                    ),
+                    child: Column(
+                      children: [
+                        Text(
+                          'Danger Duration: '
+                          '${dangerDuration ?? 0}s',
+                        ),
+                        Text(
+                          'Hands Off: '
+                          '${handsOffDuration ?? 0}s',
+                        ),
+                        Text(
+                          'Escalated: '
+                          '${escalated ? 'YES' : 'NO'}',
+                        ),
+                        Text(
+                          'Help Displayed: '
+                          '${helpDisplayed ? 'YES' : 'NO'}',
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(
+                    height: 12,
+                  ),
+
                   StatusStrip(
                     items: [
                       StatusItem(
@@ -215,11 +347,15 @@ class _GuardianScreenState extends State<GuardianScreen> {
                       ),
                       StatusItem(
                         'Wheel',
-                        handsOnWheel ? 'ON' : 'OFF',
+                        handsOnWheel
+                            ? 'ON'
+                            : 'OFF',
                       ),
                       StatusItem(
                         'Alert',
-                        isDanger ? 'YES' : 'NO',
+                        isDanger
+                            ? 'YES'
+                            : 'NO',
                       ),
                     ],
                   ),
@@ -233,15 +369,22 @@ class _GuardianScreenState extends State<GuardianScreen> {
   }
 }
 
-class _MessageScaffold extends StatelessWidget {
-  const _MessageScaffold({required this.child});
+class _MessageScaffold
+    extends StatelessWidget {
+  const _MessageScaffold({
+    required this.child,
+  });
 
   final Widget child;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(
+    BuildContext context,
+  ) {
     return Scaffold(
-      body: Center(child: child),
+      body: Center(
+        child: child,
+      ),
     );
   }
 }
